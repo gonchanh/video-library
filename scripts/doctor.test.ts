@@ -1,17 +1,22 @@
 import { expect, test } from "bun:test";
-import { fileURLToPath } from "node:url";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { checkExternalDependencies } from "./doctor";
 
-const checker = fileURLToPath(new URL("./check-dependencies.ts", import.meta.url));
+const moduleUrl = new URL("./doctor.ts", import.meta.url).href;
 
+// Import the checker in a fresh process with a controlled PATH; never invoke the update workflow.
 function runChecker(path = process.env.PATH ?? "") {
-  return Bun.spawnSync([process.execPath, checker], {
+  return Bun.spawnSync([process.execPath, "--no-env-file", "--eval", `import { checkExternalDependencies } from ${JSON.stringify(moduleUrl)}; try { for (const tool of checkExternalDependencies()) console.log(tool.name + ": " + tool.path); } catch (error) { console.error(error instanceof Error ? error.message : error); process.exitCode = 1; }`], {
     env: { ...process.env, PATH: path },
     stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 15000,
   });
 }
+
+test("importing the doctor exposes the checker without running updates", () => {
+  expect(checkExternalDependencies).toBeFunction();
+});
 
 test("external dependencies are installed and runnable", () => {
   const result = runChecker();

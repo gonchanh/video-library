@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, writeFile, copyFile, rm, readdir, appendFile, symlink, 
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkExternalDependencies } from "./check-dependencies";
+import { checkExternalDependencies } from "./doctor";
 import { applyPlan, chooseStreams, cleanupSources, episodeId, ffmpegArgs, makePlan, probe, safeName, sha256, verifyPlan, type Catalog, type Plan, type Probe } from "./media";
 
 const streamProbe: Probe = {

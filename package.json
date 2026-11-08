@@ -3,14 +3,18 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "doctor": "bun run check",
+    "doctor": "bun --no-env-file scripts/doctor.ts",
     "test": "bun test",
-    "lint": "oxlint scripts",
-    "typecheck": "bun check --no-script",
-    "check": "bun run lint && bun run typecheck && bun test"
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "typecheck": "bun check --no-script"
   },
   "devDependencies": {
     "@types/bun": "1.4.4",
-    "oxlint": "1.92.0"
+    "oxlint": "^1.92.0"
+  },
+  "module": "index.ts",
+  "peerDependencies": {
+    "typescript": "^7.0.2"
   }
 }
