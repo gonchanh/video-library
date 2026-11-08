@@ -1,3 +1,5 @@
 node_modules/
 *.partial.mkv
 plan.md
+.baml/**
+.env
