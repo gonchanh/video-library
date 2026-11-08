@@ -1,18 +1,20 @@
 #!/usr/bin/env bun
 import { parseArgs } from "node:util";
-import { readdir, realpath, mkdir, stat } from "node:fs/promises";
+import { readdir, realpath, mkdir } from "node:fs/promises";
 import { resolve, join, extname, dirname } from "node:path";
-import { applyPlan, cleanupSources, loadPlan, makePlan, probe, verifyPlan, type Catalog } from "./media";
+import { applyPlan, approvedJobs, cleanupSources, digestPlan, loadPlan, makePlan, probe, spaceBudget, verifyPlan, type Catalog } from "./media";
+import { approvalPlan, publishApproval, renderApproval } from "./approval";
+import { videoExtensions } from "./containers";
 import { resolveJobs, runQueue } from "./queue";
 
-const help = `Video library: lossless episodic MKV cleanup
+const help = `Video library: lossless video cleanup
 Run from this skill directory. Requires Bun, ffmpeg, ffprobe, GNU nice/mv and util-linux flock.
 
 bun scripts/video-library.ts inventory --source /path/to/videos
 bun scripts/video-library.ts plan --source /incoming --destination /library/show --catalog /run/catalog.json --out /run/plan.json
-bun scripts/video-library.ts apply --plan /run/plan.json --run /run/receipts --execute [--jobs auto] [--allow-missing] [--resume]
+bun scripts/video-library.ts apply --plan /run/plan.json --run /run/receipts --execute --approved-sha256 SHA_FROM_REPORT [--jobs N] [--allow-missing] [--resume]
 bun scripts/video-library.ts verify --plan /run/plan.json --run /run/receipts [--full-decode]
-bun scripts/video-library.ts cleanup --plan /run/plan.json --run /run/receipts --delete-sources
+bun scripts/video-library.ts cleanup --plan /run/plan.json --run /run/receipts --delete-sources --confirm-transfer
 
 Catalog JSON, one show and season per input folder:
 {
@@ -25,8 +27,11 @@ Catalog JSON, one show and season per input folder:
 Include EVERY expected episode for that season, not only incoming files.
 Source and destination must already exist and must not contain one another.
 Plan stops for unknown-language tracks, duplicates, unmatched IDs and collisions.
-Apply keeps originals. Cleanup deletes only verified planned sources.
---jobs auto|N applies to every command. Default auto uses the maximum.
+Plan writes checked JSON plus a matching human-readable .md approval report.
+Preserve each input container by default; catalog.container changes it only on explicit request.
+Apply keeps originals. Cleanup requires the user's later confirmation of successful transfer.
+--jobs auto|N sets plan concurrency, defaulting to the maximum.
+Execution defaults to the approved limit; --jobs can only lower it.
 Maximum jobs = max(4, floor(physical cores / 2)); explicit N can only lower it.
 FFmpeg runs at nice 15 with native multithreading.
 Verify checks hashes and structure against prior full-decode receipts.
@@ -43,7 +48,7 @@ async function inventory(root: string, jobs: number): Promise<void> {
     for (const entry of (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
       const path = join(dir, entry.name);
       if (entry.isDirectory() && !entry.name.startsWith(".video-library-")) await walk(path);
-      else entries.push({ path, video: entry.isFile() && /\.(mkv|mp4|avi|m4v|mov|webm|ts)$/i.test(extname(path)) });
+      else entries.push({ path, video: entry.isFile() && videoExtensions.has(extname(path).toLowerCase()) });
     }
   };
   await walk(root);
@@ -59,8 +64,8 @@ async function main(): Promise<void> {
     options: {
       source: { type: "string" }, destination: { type: "string" }, catalog: { type: "string" },
       out: { type: "string" }, plan: { type: "string" }, run: { type: "string" },
-      jobs: { type: "string" }, execute: { type: "boolean" }, resume: { type: "boolean" },
-      "allow-missing": { type: "boolean" }, "delete-sources": { type: "boolean" }, "full-decode": { type: "boolean" },
+      jobs: { type: "string" }, "approved-sha256": { type: "string" }, execute: { type: "boolean" }, resume: { type: "boolean" },
+      "allow-missing": { type: "boolean" }, "delete-sources": { type: "boolean" }, "confirm-transfer": { type: "boolean" }, "full-decode": { type: "boolean" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -76,29 +81,30 @@ async function main(): Promise<void> {
   if (values.resume && command !== "apply") throw new Error("--resume is only supported by apply");
   if (command === "inventory") { await inventory(required("source"), jobs); return; }
   if (command === "plan") {
+    const started = performance.now();
     const catalog: Catalog = await Bun.file(required("catalog")).json();
     const plan = await makePlan(required("source"), required("destination"), catalog, jobs);
+    const budget = await spaceBudget(plan.items, plan.destinationRoot, jobs);
     const out = required("out");
+    const review = renderApproval(approvalPlan(plan, { planPath: out, ...budget, generatedInMs: performance.now() - started }));
     await mkdir(dirname(out), { recursive: true });
-    // Exclusive creation prevents replacing the manifest of an existing run.
-    const { writeFile } = await import("node:fs/promises");
-    await writeFile(out, JSON.stringify(plan, null, 2) + "\n", { flag: "wx" });
-    const sizes = await runQueue(plan.items, jobs, async item => (await stat(item.source)).size);
-    const requiredFreeBytes = Math.ceil(sizes.reduce((sum, size) => sum + size, 0) * 1.1 + 64 * 1024 * 1024);
-    console.log(JSON.stringify({ plan: out, requiredFreeBytes, outputs: plan.items.map(i => ({ source: i.source, target: i.target, tracks: i.selected })), missing: plan.missing, existing: plan.existing, ignored: plan.ignored }, null, 2));
+    await publishApproval(out, plan, review);
+    console.log(review);
     return;
   }
   if (!["apply", "verify", "cleanup"].includes(command)) throw new Error(`Unknown command: ${command}`);
   const plan = await loadPlan(required("plan"));
   const run = required("run");
+  const executionJobs = approvedJobs(plan, values.jobs);
   if (command === "apply") {
+    if (values["approved-sha256"] !== digestPlan(plan)) throw new Error("Pass --approved-sha256 from the human-approved report; the current plan must match exactly.");
     if (!values.execute) throw new Error("Review the plan, then pass --execute to publish files.");
     if (plan.missing.length && !values["allow-missing"]) throw new Error(`Missing episodes: ${plan.missing.join(", ")}. Get approval, then pass --allow-missing.`);
-    await applyPlan(plan, run, jobs, values.resume ?? false);
-  } else if (command === "verify") await verifyPlan(plan, run, values["full-decode"] ?? false, jobs);
+    await applyPlan(plan, run, executionJobs, values.resume ?? false);
+  } else if (command === "verify") await verifyPlan(plan, run, values["full-decode"] ?? false, executionJobs);
   else {
-    if (!values["delete-sources"]) throw new Error("Source deletion requires an approved move and --delete-sources.");
-    await cleanupSources(plan, run, jobs);
+    if (!values["delete-sources"] || !values["confirm-transfer"]) throw new Error("Source deletion requires the user's confirmation of successful transfer, --delete-sources and --confirm-transfer.");
+    await cleanupSources(plan, run, executionJobs, true);
   }
   console.log(`${command} complete`);
 }

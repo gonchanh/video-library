@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, writeFile, copyFile, rm, readdir, appendFile, symlink, stat as fileStat } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkExternalDependencies } from "./doctor";
-import { applyPlan, chooseStreams, cleanupSources, episodeId, ffmpegArgs, makePlan, probe, safeName, sha256, verifyPlan, type Catalog, type Plan, type Probe } from "./media";
+import { applyPlan, digestPlan, chooseStreams, cleanupSources, episodeId, ffmpegArgs, makePlan, probe, safeName, sha256, verifyPlan, type Catalog, type Plan, type Probe } from "./media";
 
 const streamProbe: Probe = {
   streams: [
@@ -162,11 +163,17 @@ describe("real FFmpeg workflow", () => {
     expect(out.format.tags?.title).toBe("Test Show - S01E01 - Pilot");
     expect(out.format.tags?.COMMENT ?? out.format.tags?.comment).toBeUndefined();
     await verifyPlan(plan, run);
-    await cleanupSources(plan, run);
+    await expect(cleanupSources(plan, run)).rejects.toThrow("user confirmation");
+    const saved = await savePlan(join(run, ".."), plan);
+    const unconfirmed = Bun.spawnSync([process.execPath, cliPath, "cleanup", "--plan", saved, "--run", run, "--delete-sources"], { stdout: "pipe", stderr: "pipe", timeout: 60000 });
+    expect(unconfirmed.exitCode).not.toBe(0);
+    expect(unconfirmed.stderr.toString()).toContain("--confirm-transfer");
+    expect(await Bun.file(input).exists()).toBe(true);
+    await cleanupSources(plan, run, undefined, true);
     expect(await Bun.file(input).exists()).toBe(false);
     expect(await Bun.file(sidecar).text()).toBe("keep");
     expect(await Bun.file(plan.items[0].target).exists()).toBe(true);
-    await cleanupSources(plan, run);
+    await cleanupSources(plan, run, undefined, true);
   }, 60000);
   test("corrupted output blocks cleanup without deleting source", async () => {
     const { source, dest, run, input } = await setup();
@@ -174,7 +181,7 @@ describe("real FFmpeg workflow", () => {
     await applyPlan(plan, run, 1);
     await appendFile(plan.items[0].target, "corrupted");
     await expect(verifyPlan(plan, run)).rejects.toThrow();
-    await expect(cleanupSources(plan, run)).rejects.toThrow();
+    await expect(cleanupSources(plan, run, undefined, true)).rejects.toThrow();
     expect(await Bun.file(input).exists()).toBe(true);
   }, 60000);
   test("verification rejects missing or false full-decode receipts", async () => {
@@ -185,7 +192,7 @@ describe("real FFmpeg workflow", () => {
     const record = await Bun.file(receipt).json();
     await writeFile(receipt, JSON.stringify({ ...record, fullDecode: false }));
     await expect(verifyPlan(plan, run)).rejects.toThrow();
-    await expect(cleanupSources(plan, run)).rejects.toThrow();
+    await expect(cleanupSources(plan, run, undefined, true)).rejects.toThrow();
     expect(await Bun.file(input).exists()).toBe(true);
     await rm(receipt);
     await expect(verifyPlan(plan, run)).rejects.toThrow();
@@ -209,10 +216,54 @@ describe("real FFmpeg workflow", () => {
     expect(plan.items).toHaveLength(2);
     await applyPlan(plan, run, 1);
     await appendFile(plan.items[1].target, "corrupted");
-    await expect(cleanupSources(plan, run)).rejects.toThrow();
+    await expect(cleanupSources(plan, run, undefined, true)).rejects.toThrow();
     expect(await Bun.file(input).exists()).toBe(true);
     expect(await Bun.file(second).exists()).toBe(true);
   }, 60000);
+  test("only verified plans produce the generated approval report", async () => {
+    const { base, source, dest, input } = await setup();
+    const path = join(base, "catalog.json"), out = join(base, "approved.json");
+    await writeFile(path, JSON.stringify(catalog));
+    const args = [process.execPath, cliPath, "plan", "--source", source, "--destination", dest, "--catalog", path, "--out", out];
+    const planned = Bun.spawnSync(args, { stdout: "pipe", stderr: "pipe", timeout: 60000 });
+    expect(planned.exitCode, planned.stderr.toString()).toBe(0);
+    const review = await Bun.file(join(base, "approved.md")).text();
+    expect(review).toBe(planned.stdout.toString().trimEnd() + "\n");
+    expect(review).toContain("# Verified transfer plan");
+    expect(review).toContain("WARNING: missing episodes S01E02");
+    expect(review).toContain("Originals stay in place");
+    expect(await Bun.file(input).exists()).toBe(true);
+    expect(await readdir(dest)).toHaveLength(0);
+    await writeFile(path, JSON.stringify({ ...catalog, reference: "" }));
+    const rejected = Bun.spawnSync([...args.slice(0, -1), join(base, "invalid.json")], { stdout: "pipe", stderr: "pipe", timeout: 60000 });
+    expect(rejected.exitCode).not.toBe(0);
+    expect(rejected.stdout.toString()).toBe("");
+    expect(await Bun.file(join(base, "invalid.json")).exists()).toBe(false);
+    await writeFile(path, JSON.stringify(catalog));
+    const collisionOut = join(base, "collision.json"), oldReport = join(base, "collision.md");
+    await writeFile(oldReport, "previous approval");
+    const collided = Bun.spawnSync([...args.slice(0, -1), collisionOut], { stdout: "pipe", stderr: "pipe", timeout: 60000 });
+    expect(collided.exitCode).not.toBe(0);
+    expect(collided.stdout.toString()).toBe("");
+    expect(await Bun.file(collisionOut).exists()).toBe(false);
+    expect(await Bun.file(oldReport).text()).toBe("previous approval");
+  }, 60000);
+
+  test("first execution rejects a plan changed after approval", async () => {
+    const { base, source, dest, run, input } = await setup();
+    const approved = await makePlan(source, dest, catalog, 1);
+    const changed = await makePlan(source, dest, { ...catalog, episodes: [{ episode: 1, title: "Changed" }, catalog.episodes[1]] }, 1);
+    const path = await savePlan(base, changed);
+    const rejected = Bun.spawnSync([
+      process.execPath, cliPath, "apply", "--plan", path, "--run", run, "--execute", "--allow-missing", "--approved-sha256", digestPlan(approved),
+    ], { stdout: "pipe", stderr: "pipe", timeout: 60000 });
+    expect(rejected.exitCode).not.toBe(0);
+    expect(rejected.stderr.toString()).toContain("human-approved report");
+    expect(await Bun.file(join(run, "apply.lock")).exists()).toBe(false);
+    expect(await sha256(input)).toBe(approved.items[0].sha256);
+    expect(await readdir(dest)).toHaveLength(0);
+  }, 60000);
+
   test("destination symlinks cannot redirect publication", async () => {
     const { base, source, dest, run } = await setup();
     const c = { ...catalog, seasonFolders: true };
@@ -237,7 +288,7 @@ async function savePlan(base: string, plan: Plan) {
 function applyCLI(plan: string, run: string, resume = false, path = process.env.PATH ?? "") {
   return Bun.spawnSync([
     process.execPath, cliPath, "apply", "--plan", plan, "--run", run,
-    "--execute", "--allow-missing", "--jobs", "1", ...(resume ? ["--resume"] : []),
+    "--execute", "--approved-sha256", digestPlan(JSON.parse(readFileSync(plan, "utf8"))), "--allow-missing", "--jobs", "1", ...(resume ? ["--resume"] : []),
   ], { env: { ...process.env, PATH: path }, stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 60000 });
 }
 
@@ -407,7 +458,7 @@ describe("resume and interruption integrity", () => {
     await rm(join(run, "run.json"));
     const shortened = { ...plan, items: [plan.items[0]] };
     await expect(verifyPlan(shortened, run)).rejects.toThrow("Missing run manifest");
-    await expect(cleanupSources(shortened, run)).rejects.toThrow("Missing run manifest");
+    await expect(cleanupSources(shortened, run, undefined, true)).rejects.toThrow("Missing run manifest");
     expect(await sha256(input)).toBe(plan.items[0].sha256);
     expect(await sha256(second)).toBe(plan.items[1].sha256);
   }, 60000);

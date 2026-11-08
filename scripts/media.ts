@@ -1,19 +1,20 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises';
+import { checkContainer, containerProfile, targetExtension, videoExtensions } from './containers';
 import { resolveJobs, runQueue } from './queue';
 import { withRunLock } from './run-lock';
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
 
 export type Stream = { index: number; codec_type: string; codec_name: string; width?: number; height?: number; channels?: number; tags?: Record<string, string>; disposition?: Record<string, number> };
 export type Probe = { streams: Stream[]; format: { duration?: string; tags?: Record<string, string> }; chapters?: unknown[] };
-export type Catalog = { show: string; season: number; reference: string; episodes: { episode: number; title: string }[]; seasonFolders: boolean };
+export type Catalog = { show: string; season: number; reference: string; episodes: { episode: number; title: string }[]; seasonFolders: boolean; container?: string; languageOverrides?: Record<string, Record<string, string>> };
 export type Item = { source: string; target: string; title: string; sha256: string; probe: Probe; selected: number[] };
-export type Plan = { version: 1; sourceRoot: string; destinationRoot: string; catalog: Catalog; items: Item[]; missing: string[]; existing: string[]; ignored: string[]; createdAt: string };
+export type Plan = { version: 2; jobs: number; sourceRoot: string; destinationRoot: string; catalog: Catalog; items: Item[]; missing: string[]; existing: string[]; ignored: string[]; createdAt: string };
 type Receipt = { source: string; target: string; sourceSha256: string; outputSha256: string; fullDecode: true };
 type RunManifest = { version: 1; planSha256: string };
 type Checkpoint = { version: 1; planSha256: string; source: string; target: string; sourceSha256: string; tempDir: string; stage: 'working' | 'validated'; outputSha256?: string; fullDecode?: true };
-const videos = new Set(['.mkv', '.mp4', '.avi', '.m4v', '.mov', '.webm', '.ts']);
+const videos = videoExtensions;
 const shaPattern = /^[0-9a-f]{64}$/;
 const idPattern = /(?<!\d)S\d{2}E\d{2}(?!\d)/gi;
 const text = (v: unknown): v is string => typeof v === 'string';
@@ -77,7 +78,7 @@ export function safeName(input: string): string {
 }
 const lang = (s: Stream) => s.tags?.language?.toLowerCase();
 const english = (s: Stream) => ['eng', 'en'].includes(lang(s) ?? '');
-const sdh = (s: Stream) => /\b(sdh|hearing[ -]?impaired)\b/i.test(s.tags?.title ?? '') || s.disposition?.hearing_impaired === 1;
+const sdh = (s: Stream) => /\b(sdh|hearing[ -]?impaired)\b/i.test(s.tags?.title ?? s.tags?.handler_name ?? '') || s.disposition?.hearing_impaired === 1;
 export function chooseStreams(p: Probe): number[] {
   if (!Array.isArray(p.streams)) fail('Missing streams');
   for (const s of p.streams) if (['audio', 'subtitle'].includes(s.codec_type) && (!lang(s) || lang(s) === 'und')) fail(`Unknown language on stream ${s.index}; provide explicit mapping before planning`);
@@ -88,30 +89,51 @@ export function chooseStreams(p: Probe): number[] {
   const subtitles = p.streams.filter(s => s.codec_type === 'subtitle' && english(s));
   const font = p.streams.some(s => s.codec_type === 'attachment' && (/font|truetype|opentype/i.test(s.tags?.mimetype ?? '') || /\.(ttf|otf)$/i.test(s.tags?.filename ?? '') || /^(ttf|otf)$/i.test(s.codec_name)));
   if (font && subtitles.some(s => ['ass', 'ssa'].includes(s.codec_name))) fail('Styled subtitles have embedded fonts; review attachment retention before planning');
-  const unclassified = subtitles.filter(s => !sdh(s) && (!s.tags?.title?.trim() || /^(english|en|eng)$/i.test(s.tags.title.trim())));
+  const unclassified = subtitles.filter(s => !sdh(s) && (!s.tags?.title?.trim() || /^(english|en|eng)$/i.test(s.tags.title.trim())) && (!s.tags?.handler_name?.trim() || /^(english|en|eng|subtitlehandler)$/i.test(s.tags.handler_name.trim())));
   if (unclassified.length > 1) fail('Ambiguous English subtitle tracks; confirm regular versus SDH labels before planning');
   return [video.index, ...audio.map(s => s.index), ...subtitles.map(s => s.index)];
 }
 export function ffmpegArgs(item: Item, output: string): string[] {
   const selected = item.selected.map(i => item.probe.streams.find(s => s.index === i) ?? fail(`Unknown stream ${i}`));
+  const p = containerProfile(extname(item.target));
   const args = ['ffmpeg', '-nostdin', '-n', '-v', 'warning', '-i', item.source];
   for (const s of selected) args.push('-map', `0:${s.index}`);
-  args.push('-map_chapters', '0', '-map_metadata', '-1', '-map_metadata:s', '-1', '-c', 'copy', '-metadata', `title=${item.title}`);
+  args.push('-map_chapters', '0', '-map_metadata', '-1', '-map_metadata:s', '-1', '-c', 'copy');
+  if (p.titleTag) args.push('-metadata', `title=${item.title}`);
   let a = 0, sub = 0, v = 0;
   for (const s of selected) {
-    if (s.codec_type === 'video') args.push(`-disposition:v:${v++}`, 'default');
+    if (s.codec_type === 'video') {
+      if (p.defaultFlags) args.push(`-disposition:v:${v}`, 'default');
+      v++;
+    }
     if (s.codec_type === 'audio') {
-      args.push(`-metadata:s:a:${a}`, 'language=eng', `-disposition:a:${a}`, a === 0 ? 'default' : '0'); a++;
+      if (p.languageTags) args.push(`-metadata:s:a:${a}`, 'language=eng');
+      if (p.defaultFlags) args.push(`-disposition:a:${a}`, a === 0 ? 'default' : '0');
+      a++;
     }
     if (s.codec_type === 'subtitle') {
-      args.push(`-metadata:s:s:${sub}`, 'language=eng', `-metadata:s:s:${sub}`, `title=${sdh(s) ? 'English SDH' : 'English'}`, `-disposition:s:${sub}`, '0'); sub++;
+      if (p.languageTags) args.push(`-metadata:s:s:${sub}`, 'language=eng');
+      if (p.subtitleLabel) args.push(`-metadata:s:s:${sub}`, `${p.subtitleLabel}=${sdh(s) ? 'English SDH' : 'English'}`);
+      if (p.defaultFlags) args.push(`-disposition:s:${sub}`, '0');
+      sub++;
     }
   }
-  return [...args, '-f', 'matroska', output];
+  return [...args, '-f', p.muxer, output];
 }
 function catalogCheck(c: unknown): asserts c is Catalog {
   if (!obj(c) || !text(c.show) || !text(c.reference) || !c.reference.trim() || !Number.isInteger(c.season) || (c.season as number) < 0 || (c.season as number) > 99 || typeof c.seasonFolders !== 'boolean' || !Array.isArray(c.episodes)) fail('Invalid catalog');
   const catalog = c as unknown as Catalog;
+  let reference: URL;
+  try { reference = new URL(catalog.reference); } catch { throw new Error('Catalog requires an episode-list URL'); }
+  if (!['https:', 'http:'].includes(reference.protocol) || reference.username || reference.password || !catalog.episodes.length) fail('Catalog requires an episode-list URL and a nonempty episode list');
+  if (catalog.container !== undefined && (!text(catalog.container) || catalog.container !== targetExtension('unused.mkv', catalog.container))) fail('Catalog container must be a supported lowercase extension such as .mp4');
+  if (catalog.languageOverrides !== undefined) {
+    if (!obj(catalog.languageOverrides)) fail('Invalid languageOverrides');
+    for (const [file, overrides] of Object.entries(catalog.languageOverrides)) {
+      if (!file || file.startsWith('/') || file.includes('\\') || file.includes(':') || file.split('/').some(part => !part || part === '.' || part === '..') || !obj(overrides) || !Object.keys(overrides).length) fail(`Invalid language override path or mapping: ${file}`);
+      for (const [index, language] of Object.entries(overrides)) if (!/^(0|[1-9]\d*)$/.test(index) || !text(language) || !/^[a-z]{2,3}$/.test(language) || language === 'und') fail(`Invalid language override ${file}:${index}`);
+    }
+  }
   if (catalog.show !== safeName(catalog.show)) fail('Show must be a safe filename');
   const seen = new Set<number>();
   for (const ep of catalog.episodes) {
@@ -120,8 +142,28 @@ function catalogCheck(c: unknown): asserts c is Catalog {
     seen.add(ep.episode as number); safeName(ep.title as string);
   }
 }
+function relativeSource(root: string, source: string): string {
+  if (!within(root, source)) fail(`Language override source outside root: ${source}`);
+  return relative(root, source).split(sep).join('/');
+}
+function checkOverrideFiles(catalog: Catalog, root: string, sources: string[]): void {
+  const names = new Set(sources.map(source => relativeSource(root, source)));
+  for (const name of Object.keys(catalog.languageOverrides ?? {})) if (!names.has(name)) fail(`Unknown language override source: ${name}`);
+}
+// Overrides are approval-bound catalog decisions; never mutate raw ffprobe fingerprints.
+export function effectiveProbe(plan: Plan, item: Item): Probe {
+  const key = relativeSource(plan.sourceRoot, item.source);
+  const overrides = plan.catalog.languageOverrides?.[key] ?? {};
+  const streams = item.probe.streams.map(stream => ({ ...stream, tags: stream.tags ? { ...stream.tags } : undefined }));
+  for (const [index, language] of Object.entries(overrides)) {
+    const stream = streams.find(s => String(s.index) === index);
+    if (!stream || !['audio', 'subtitle'].includes(stream.codec_type)) throw new Error(`Language override ${key}:${index} must identify an audio or subtitle stream`);
+    stream.tags = { ...stream.tags, language };
+  }
+  return { ...item.probe, streams };
+}
 function planCheck(v: unknown): asserts v is Plan {
-  if (!obj(v) || v.version !== 1 || !text(v.sourceRoot) || !isAbsolute(v.sourceRoot) || !text(v.destinationRoot) || !isAbsolute(v.destinationRoot) || !text(v.createdAt) || !Array.isArray(v.items) || !Array.isArray(v.missing) || !Array.isArray(v.existing) || !Array.isArray(v.ignored)) fail('Invalid plan');
+  if (!obj(v) || v.version !== 2 || !Number.isSafeInteger(v.jobs) || (v.jobs as number) < 1 || !text(v.sourceRoot) || !isAbsolute(v.sourceRoot) || !text(v.destinationRoot) || !isAbsolute(v.destinationRoot) || !text(v.createdAt) || !Array.isArray(v.items) || !Array.isArray(v.missing) || !Array.isArray(v.existing) || !Array.isArray(v.ignored)) fail('Invalid plan');
   const plan = v as unknown as Plan;
   catalogCheck(plan.catalog);
   for (const field of ['missing', 'existing', 'ignored'] as const) if (!plan[field].every(text)) fail(`Invalid ${field}`);
@@ -131,6 +173,7 @@ function planCheck(v: unknown): asserts v is Plan {
     if (i.probe.format.duration !== undefined && !text(i.probe.format.duration)) fail('Invalid duration');
     if (i.probe.format.tags !== undefined && (!obj(i.probe.format.tags) || !Object.values(i.probe.format.tags).every(text))) fail('Invalid format tags');
     if (i.probe.chapters !== undefined && !Array.isArray(i.probe.chapters)) fail('Invalid chapters');
+    containerProfile(extname(i.target));
   }
 }
 export async function loadPlan(path: string): Promise<Plan> { const v: unknown = JSON.parse(await readFile(path, 'utf8')); planCheck(v); planMapping(v); return v; }
@@ -157,11 +200,20 @@ async function targetSafe(root: string, target: string): Promise<void> {
   try { await lstat(target); fail(`Target already exists: ${target}`); }
   catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
 }
+export async function spaceBudget(items: Item[], destinationRoot: string, jobs?: number | string): Promise<{ requiredFreeBytes: number; availableFreeBytes: number }> {
+  const sizes = await runQueue(items, resolveJobs(jobs), async item => (await stat(item.source)).size);
+  const requiredFreeBytes = Math.ceil(sizes.reduce((sum, size) => sum + size, 0) * 1.1 + 64 * 1024 * 1024);
+  const space = await statfs(destinationRoot);
+  const availableFreeBytes = space.bavail * space.bsize;
+  if (availableFreeBytes < requiredFreeBytes) fail('Insufficient free destination space');
+  return { requiredFreeBytes, availableFreeBytes };
+}
 export async function makePlan(sourceRoot: string, destinationRoot: string, catalog: Catalog, jobs?: number | string): Promise<Plan> {
   const workers = resolveJobs(jobs);
   catalogCheck(catalog);
   const [src, dst] = await roots(sourceRoot, destinationRoot);
   const sources = await scan(src);
+  checkOverrideFiles(catalog, src, sources.files);
   const seasonDir = catalog.seasonFolders ? join(dst, `SEASON ${catalog.season}`) : dst;
   if (catalog.seasonFolders) {
     try { const dir = await lstat(seasonDir); if (!dir.isDirectory() || dir.isSymbolicLink()) fail(`Unsafe season directory: ${seasonDir}`); }
@@ -187,7 +239,7 @@ export async function makePlan(sourceRoot: string, destinationRoot: string, cata
     sourceIds.add(id);
     const ep = known.get(id)!;
     const title = `${catalog.show} - ${id} - ${safeName(ep.title)}`;
-    const target = join(seasonDir, `${title}.mkv`);
+    const target = join(seasonDir, `${title}${targetExtension(path, catalog.container)}`);
     const key = target.toLowerCase();
     if (outputNames.has(key) || [...existingScan.files, ...existingScan.ignored].some(f => f.toLowerCase() === key)) fail(`Case-insensitive target collision: ${target}`);
     let siblings = siblingNames.get(dirname(target));
@@ -202,23 +254,28 @@ export async function makePlan(sourceRoot: string, destinationRoot: string, cata
     const id = episodeId(basename(path))!;
     const ep = known.get(id)!;
     const title = `${catalog.show} - ${id} - ${safeName(ep.title)}`;
-    const target = join(seasonDir, `${title}.mkv`);
+    const target = join(seasonDir, `${title}${targetExtension(path, catalog.container)}`);
     await sourceSafe({ sourceRoot: src } as Plan, { source: path } as Item);
     await targetSafe(dst, target);
     const [p, hash] = await Promise.all([probe(path), sha256(path)]);
-    return { source: path, target, title, sha256: hash, probe: p, selected: chooseStreams(p) };
+    const item = { source: path, target, title, sha256: hash, probe: p, selected: [] as number[] };
+    item.selected = chooseStreams(effectiveProbe({ sourceRoot: src, catalog } as Plan, item));
+    checkContainer(containerProfile(extname(target)), p, item.selected);
+    return item;
   });
-  return { version: 1, sourceRoot: src, destinationRoot: dst, catalog, items, missing: [...known.keys()].filter(id => !sourceIds.has(id) && !existingIds.has(id)), existing: existing.sort(), ignored: [...sources.ignored, ...ignoredDestination], createdAt: new Date().toISOString() };
+  return { version: 2, jobs: workers, sourceRoot: src, destinationRoot: dst, catalog, items, missing: [...known.keys()].filter(id => !sourceIds.has(id) && !existingIds.has(id)), existing: existing.sort(), ignored: [...sources.ignored, ...ignoredDestination], createdAt: new Date().toISOString() };
 }
 function planMapping(plan: Plan): void {
+  checkOverrideFiles(plan.catalog, plan.sourceRoot, plan.items.map(item => item.source));
   const sources = new Set<string>(), targets = new Set<string>();
   for (const item of plan.items) {
     const id = episodeId(basename(item.source));
     const ep = plan.catalog.episodes.find(e => id === ident(plan.catalog.season, e.episode));
     if (!ep) throw new Error(`Unknown episode in plan: ${item.source}`);
     const title = `${plan.catalog.show} - ${id} - ${safeName(ep.title)}`;
-    const target = join(plan.destinationRoot, ...(plan.catalog.seasonFolders ? [`SEASON ${plan.catalog.season}`] : []), `${title}.mkv`);
-    if (item.title !== title || item.target !== target || JSON.stringify(item.selected) !== JSON.stringify(chooseStreams(item.probe))) fail(`Invalid item mapping: ${item.source}`);
+    const target = join(plan.destinationRoot, ...(plan.catalog.seasonFolders ? [`SEASON ${plan.catalog.season}`] : []), `${title}${targetExtension(item.source, plan.catalog.container)}`);
+    if (item.title !== title || item.target !== target || JSON.stringify(item.selected) !== JSON.stringify(chooseStreams(effectiveProbe(plan, item)))) fail(`Invalid item mapping: ${item.source}`);
+    checkContainer(containerProfile(extname(target)), item.probe, item.selected);
     if (sources.has(item.source) || targets.has(item.target.toLowerCase())) fail('Duplicate plan item');
     sources.add(item.source); targets.add(item.target.toLowerCase());
   }
@@ -243,19 +300,31 @@ async function publishedSafe(plan: Plan, item: Item): Promise<void> {
   if (!st.isFile() || st.isSymbolicLink() || !within(plan.destinationRoot, await realpath(item.target))) fail(`Unsafe output: ${item.target}`);
 }
 async function validateOutput(item: Item, output: string, log: string, decode = true): Promise<void> {
+  const p = containerProfile(extname(item.target));
   const got = await probe(output);
   const expected = item.selected.map(i => item.probe.streams.find(s => s.index === i)!);
   const tracks = got.streams.filter(s => ['video', 'audio', 'subtitle'].includes(s.codec_type));
   if (tracks.length !== expected.length || got.streams.length !== expected.length) fail(`Unexpected track count in ${output}`);
+  // Some muxers (notably FLV) reorder video and audio regardless of -map order.
+  const used = new Set<Stream>();
+  const ordered = expected.map(x => {
+    const found = tracks.find(y => y.codec_type === x.codec_type && !used.has(y));
+    if (!found) throw new Error(`Track type mismatch in ${output}`);
+    used.add(found); return found;
+  });
   let a = 0, v = 0;
   for (let n = 0; n < expected.length; n++) {
-    const x = expected[n], y = tracks[n];
+    const x = expected[n], y = ordered[n];
     if (x.codec_type !== y.codec_type || x.codec_name !== y.codec_name || (x.codec_type === 'video' && (x.width !== y.width || x.height !== y.height)) || (x.codec_type === 'audio' && x.channels !== y.channels)) fail(`Track mismatch ${n}: ${output}`);
-    if (x.codec_type === 'video' && y.disposition?.default !== (v++ === 0 ? 1 : 0)) fail(`Video disposition mismatch: ${output}`);
-    if (x.codec_type === 'audio' && (lang(y) !== 'eng' || y.disposition?.default !== (a++ === 0 ? 1 : 0))) fail(`Audio metadata mismatch: ${output}`);
-    if (x.codec_type === 'subtitle' && (lang(y) !== 'eng' || y.tags?.title !== (sdh(x) ? 'English SDH' : 'English') || y.disposition?.default === 1 || y.disposition?.forced === 1)) fail(`Subtitle metadata mismatch: ${output}`);
+    if (x.codec_type === 'video' && p.defaultFlags && y.disposition?.default !== (v === 0 ? 1 : 0)) fail(`Video disposition mismatch: ${output}`);
+    if (x.codec_type === 'audio' && ((p.languageTags && lang(y) !== 'eng') || (p.defaultFlags && y.disposition?.default !== (a === 0 ? 1 : 0)))) fail(`Audio metadata mismatch: ${output}`);
+    if (x.codec_type === 'video') v++;
+    if (x.codec_type === 'audio') a++;
+    const subtitleLabel = p.subtitleLabel ? y.tags?.[p.subtitleLabel] : undefined;
+    const subtitleDefaultUnsupported = ['mp4', 'mov'].includes(p.muxer);
+    if (x.codec_type === 'subtitle' && ((p.languageTags && lang(y) !== 'eng') || (p.subtitleLabel && subtitleLabel !== (sdh(x) ? 'English SDH' : 'English')) || (p.defaultFlags && !subtitleDefaultUnsupported && y.disposition?.default === 1) || (p.defaultFlags && y.disposition?.forced === 1))) fail(`Subtitle metadata mismatch: ${output}`);
   }
-  if ((got.format.tags?.title ?? got.format.tags?.TITLE) !== item.title) fail(`Title mismatch: ${output}`);
+  if (p.titleTag && (got.format.tags?.title ?? got.format.tags?.TITLE) !== item.title) fail(`Title mismatch: ${output}`);
   if ((got.chapters?.length ?? 0) !== (item.probe.chapters?.length ?? 0)) fail(`Chapter count mismatch: ${output}`);
   const before = Number(item.probe.format.duration), after = Number(got.format.duration);
   if (!Number.isFinite(before) || !Number.isFinite(after) || Math.abs(before - after) > 2) fail(`Duration discrepancy ${before}s vs ${after}s: ${output}; review subtitle tails or source`);
@@ -275,7 +344,7 @@ async function durableOutput(path: string, root: string): Promise<void> {
   try { await handle.sync(); } finally { await handle.close(); }
   await syncDirectories(dirname(path), root);
 }
-const digestPlan = (plan: Plan): string => createHash('sha256').update(JSON.stringify(canonical(plan))).digest('hex');
+export const digestPlan = (plan: Plan): string => createHash('sha256').update(JSON.stringify(canonical(plan))).digest('hex');
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
   if (obj(value)) return Object.fromEntries(Object.keys(value).sort().filter(k => value[k] !== undefined).map(k => [k, canonical(value[k])]));
@@ -350,7 +419,7 @@ async function validateApplyInputs(plan: Plan, runDir: string, digest: string, j
     if (!present && !records.get(item.source)?.done) fail(`Missing uncompleted source: ${item.source}`);
     if (present) {
       const [hash, currentProbe] = await Promise.all([sha256(item.source), probe(item.source)]);
-      if (hash !== item.sha256 || JSON.stringify(canonical(currentProbe)) !== JSON.stringify(canonical(item.probe)) || JSON.stringify(chooseStreams(currentProbe)) !== JSON.stringify(item.selected)) fail(`Source changed: ${item.source}`);
+      if (hash !== item.sha256 || JSON.stringify(canonical(currentProbe)) !== JSON.stringify(canonical(item.probe)) || JSON.stringify(chooseStreams(effectiveProbe(plan, { ...item, probe: currentProbe }))) !== JSON.stringify(item.selected)) fail(`Source changed: ${item.source}`);
     }
     const r = records.get(item.source)!;
     if (r.done) await checkedOutput(plan, item, r.done.outputSha256, itemLog(runDir, item));
@@ -418,7 +487,7 @@ async function work(item: Item, plan: Plan, runDir: string, digest: string, reco
     const tempDir = await mkdtemp(join(dirname(item.target), '.video-library-'));
     checkpoint = { version: 1, planSha256: digest, source: item.source, target: item.target, sourceSha256: item.sha256, tempDir, stage: 'working' };
     await atomicRecord(checkpointPath(runDir, item), checkpoint);
-    const partial = join(tempDir, 'output.partial.mkv');
+    const partial = join(tempDir, `output.partial${extname(item.target)}`);
     console.error(`remux ${basename(item.target)}`);
     await exec(ffmpegArgs(item, partial), log);
     console.error(`decode ${basename(item.target)}`);
@@ -433,7 +502,7 @@ async function work(item: Item, plan: Plan, runDir: string, digest: string, reco
   if (await realpath(plan.destinationRoot) !== plan.destinationRoot || (await stat(plan.destinationRoot)).dev !== dev) fail('Destination mount/root changed before publication');
   await targetSafeAncestors(plan.destinationRoot, item.target);
   if (!(await exists(item.target))) {
-    const partial = join(checkpoint.tempDir, 'output.partial.mkv');
+    const partial = join(checkpoint.tempDir, `output.partial${extname(item.target)}`);
     if (!(await exists(partial))) fail(`Validated partial missing: ${partial}`);
     const st = await lstat(partial);
     if (!st.isFile() || st.isSymbolicLink() || await sha256(partial) !== checkpoint.outputSha256) fail(`Validated partial changed: ${partial}`);
@@ -444,8 +513,13 @@ async function work(item: Item, plan: Plan, runDir: string, digest: string, reco
   await finish(item, plan, runDir, checkpoint);
   console.error(`done ${basename(item.target)}`);
 }
+export function approvedJobs(plan: Plan, jobs?: number | string): number {
+  const workers = jobs === undefined ? Math.min(plan.jobs, resolveJobs()) : resolveJobs(jobs);
+  if (workers > plan.jobs) fail('Cannot exceed approved concurrency; regenerate the plan for a higher limit');
+  return workers;
+}
 export async function applyPlan(plan: Plan, runDir: string, jobs?: number | string, resume = false): Promise<void> {
-  const workers = resolveJobs(jobs);
+  const workers = approvedJobs(plan, jobs);
   if (!isAbsolute(runDir)) fail('runDir must be absolute');
   await withRunLock(runDir, async () => {
     const digest = digestPlan(plan);
@@ -455,9 +529,7 @@ export async function applyPlan(plan: Plan, runDir: string, jobs?: number | stri
     const records = await validateApplyInputs(plan, runDir, digest, workers);
     await exec(['ffmpeg', '-version']); await exec(['ffprobe', '-version']);
     const needsRemux = plan.items.filter(item => !records.get(item.source)?.done && records.get(item.source)?.checkpoint?.stage !== 'validated');
-    const required = (await Promise.all(needsRemux.map(async item => (await stat(item.source)).size))).reduce((n, size) => n + size, 0) * 1.1 + 64 * 1024 * 1024;
-    const space = await statfs(plan.destinationRoot);
-    if (space.bavail * space.bsize < required) fail('Insufficient free destination space');
+    await spaceBudget(needsRemux, plan.destinationRoot, workers);
     if (!hasManifest) await atomicRecord(join(runDir, 'run.json'), { version: 1, planSha256: digest } satisfies RunManifest);
     const dev = (await stat(plan.destinationRoot)).dev;
     await runQueue(plan.items, workers, async (item, index) => {
@@ -475,15 +547,16 @@ async function verifiedItem(plan: Plan, runDir: string, item: Item, fullDecode: 
   if (durable) await durableOutput(item.target, plan.destinationRoot);
 }
 export async function verifyPlan(plan: Plan, runDir: string, fullDecode = false, jobs?: number | string): Promise<void> {
-  const workers = resolveJobs(jobs);
+  const workers = approvedJobs(plan, jobs);
   await withRunLock(runDir, async () => {
     await checkRoots(plan);
     await manifest(runDir, digestPlan(plan), true);
     await runQueue(plan.items, workers, item => verifiedItem(plan, runDir, item, fullDecode, false));
   });
 }
-export async function cleanupSources(plan: Plan, runDir: string, jobs?: number | string): Promise<void> {
-  const workers = resolveJobs(jobs);
+export async function cleanupSources(plan: Plan, runDir: string, jobs?: number | string, confirmedTransfer = false): Promise<void> {
+  if (!confirmedTransfer) fail('Source deletion requires user confirmation of successful transfer');
+  const workers = approvedJobs(plan, jobs);
   await withRunLock(runDir, async () => {
     await checkRoots(plan);
     await manifest(runDir, digestPlan(plan), true);
