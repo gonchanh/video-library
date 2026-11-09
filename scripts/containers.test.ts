@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { checkContainer, containerProfile, targetExtension } from './containers';
+import { checkContainer, checkSourceContainer, containerProfile, targetExtension } from './containers';
 import { applyPlan, effectiveProbe, makePlan, probe, verifyPlan, type Catalog, type Probe } from './media';
 import { checkExternalDependencies } from './doctor';
 
@@ -21,6 +21,11 @@ test('profiles preserve the source extension by default and never silently subst
   expect(targetExtension('episode.MP4')).toBe('.mp4');
   expect(targetExtension('episode.mkv', '.mp4')).toBe('.mp4');
   expect(() => targetExtension('episode.xyz')).toThrow('Unsupported output container');
+});
+test('mislabeled extensions never cause an unapproved container conversion', () => {
+  const input = { ...sample, format: { format_name: 'matroska,webm' } };
+  expect(() => checkSourceContainer('clip.mkv', input)).not.toThrow();
+  expect(() => checkSourceContainer('clip.mp4', input)).toThrow('disagrees');
 });
 test('rejects incompatible selected tracks or metadata before remux', () => {
   expect(() => checkContainer(containerProfile('.mp4'), sample, [0, 1, 2])).toThrow('mov_text');

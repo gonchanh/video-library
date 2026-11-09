@@ -4,14 +4,17 @@ import { readdir, realpath, mkdir } from "node:fs/promises";
 import { resolve, join, extname, dirname } from "node:path";
 import { applyPlan, approvedJobs, cleanupSources, digestPlan, loadPlan, makePlan, probe, spaceBudget, verifyPlan, type Catalog } from "./media";
 import { approvalPlan, publishApproval, renderApproval } from "./approval";
+import { attachMetadata } from "./metadata-plan";
+import { parseApprovalPlan } from "./structured";
 import { videoExtensions } from "./containers";
 import { resolveJobs, runQueue } from "./queue";
 
 const help = `Video library: lossless video cleanup
-Run from this skill directory. Requires Bun, ffmpeg, ffprobe, GNU nice/mv and util-linux flock.
+Run from this skill directory after bun run doctor.
+Linux uses GNU nice/mv and util-linux flock; Windows uses PowerShell 5.1.
 
 bun scripts/video-library.ts inventory --source /path/to/videos
-bun scripts/video-library.ts plan --source /incoming --destination /library/show --catalog /run/catalog.json --out /run/plan.json
+bun scripts/video-library.ts plan --source /incoming --destination /library/show --catalog /run/catalog.json --out /run/plan.json [--metadata /run/metadata-map.json]
 bun scripts/video-library.ts apply --plan /run/plan.json --run /run/receipts --execute --approved-sha256 SHA_FROM_REPORT [--jobs N] [--allow-missing] [--resume]
 bun scripts/video-library.ts verify --plan /run/plan.json --run /run/receipts [--full-decode]
 bun scripts/video-library.ts cleanup --plan /run/plan.json --run /run/receipts --delete-sources --confirm-transfer
@@ -25,6 +28,13 @@ Catalog JSON, one show and season per input folder:
   "episodes": [{"episode": 1, "title": "Pilot"}]
 }
 Include EVERY expected episode for that season, not only incoming files.
+Movies use a separate flat destination, e.g. /library/Movies, and this catalog:
+{"kind":"movies","reference":"https://www.imdb.com/","movies":[{"file":"The.Matrix.1999.mp4","title":"The Matrix","year":1999,"reference":"https://www.imdb.com/title/tt0133093/"}]}
+Movie output: Matrix, The - 1999.mp4. No per-movie folders.
+Optional metadata map: source-relative filename -> BAML-validated Jellyfin metadata.
+Prepare TMDB metadata with bun scripts/tmdb.ts --help before planning.
+Without API access use IMDb as the default movie reference; metadata can be wrong or incomplete.
+Catalog languageOverrides maps source-relative filenames and stream indices to human-confirmed languages.
 Source and destination must already exist and must not contain one another.
 Plan stops for unknown-language tracks, duplicates, unmatched IDs and collisions.
 Plan writes checked JSON plus a matching human-readable .md approval report.
@@ -33,7 +43,8 @@ Apply keeps originals. Cleanup requires the user's later confirmation of success
 --jobs auto|N sets plan concurrency, defaulting to the maximum.
 Execution defaults to the approved limit; --jobs can only lower it.
 Maximum jobs = max(4, floor(physical cores / 2)); explicit N can only lower it.
-FFmpeg runs at nice 15 with native multithreading.
+FFmpeg uses native multithreading, at nice 15 on Linux.
+Windows support is machine-untested; automatic source cleanup is disabled.
 Verify checks hashes and structure against prior full-decode receipts.
 Use --full-decode only when a fresh full decode is wanted.
 Resume with the SAME --plan and --run, adding --execute --resume.
@@ -63,7 +74,7 @@ async function main(): Promise<void> {
     args: Bun.argv.slice(2), allowPositionals: true, strict: true,
     options: {
       source: { type: "string" }, destination: { type: "string" }, catalog: { type: "string" },
-      out: { type: "string" }, plan: { type: "string" }, run: { type: "string" },
+      out: { type: "string" }, plan: { type: "string" }, run: { type: "string" }, metadata: { type: "string" },
       jobs: { type: "string" }, "approved-sha256": { type: "string" }, execute: { type: "boolean" }, resume: { type: "boolean" },
       "allow-missing": { type: "boolean" }, "delete-sources": { type: "boolean" }, "confirm-transfer": { type: "boolean" }, "full-decode": { type: "boolean" },
       help: { type: "boolean", short: "h" },
@@ -81,12 +92,14 @@ async function main(): Promise<void> {
   if (values.resume && command !== "apply") throw new Error("--resume is only supported by apply");
   if (command === "inventory") { await inventory(required("source"), jobs); return; }
   if (command === "plan") {
+    const out = required("out");
+    if (!/\.json$/i.test(out)) throw new Error("--out must name a new .json planning artifact outside media folders");
     const started = performance.now();
     const catalog: Catalog = await Bun.file(required("catalog")).json();
-    const plan = await makePlan(required("source"), required("destination"), catalog, jobs);
+    const draft = await makePlan(required("source"), required("destination"), catalog, jobs);
+    const plan = await attachMetadata(draft, values.metadata ? await Bun.file(resolve(values.metadata)).json() : {});
     const budget = await spaceBudget(plan.items, plan.destinationRoot, jobs);
-    const out = required("out");
-    const review = renderApproval(approvalPlan(plan, { planPath: out, ...budget, generatedInMs: performance.now() - started }));
+    const review = renderApproval(parseApprovalPlan(JSON.stringify(approvalPlan(plan, { planPath: out, ...budget, generatedInMs: Math.round(performance.now() - started) }))));
     await mkdir(dirname(out), { recursive: true });
     await publishApproval(out, plan, review);
     console.log(review);

@@ -1,17 +1,24 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, statfs, unlink, writeFile } from 'node:fs/promises';
-import { checkContainer, containerProfile, targetExtension, videoExtensions } from './containers';
+import { lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { checkContainer, checkSourceContainer, containerProfile, targetExtension, videoExtensions } from './containers';
 import { resolveJobs, runQueue } from './queue';
 import { withRunLock } from './run-lock';
+import { assertCleanupDurability, availableBytes, durableOutput, ffmpegCommand, publicationCommand, syncDirectories } from './platform';
+import { metadataHash, metadataPath, renderNfo } from './jellyfin';
+import { parseJellyfinMetadata, type JellyfinMetadata } from './structured';
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
 
 export type Stream = { index: number; codec_type: string; codec_name: string; width?: number; height?: number; channels?: number; tags?: Record<string, string>; disposition?: Record<string, number> };
-export type Probe = { streams: Stream[]; format: { duration?: string; tags?: Record<string, string> }; chapters?: unknown[] };
-export type Catalog = { show: string; season: number; reference: string; episodes: { episode: number; title: string }[]; seasonFolders: boolean; container?: string; languageOverrides?: Record<string, Record<string, string>> };
-export type Item = { source: string; target: string; title: string; sha256: string; probe: Probe; selected: number[] };
+export type Probe = { streams: Stream[]; format: { duration?: string; format_name?: string; tags?: Record<string, string> }; chapters?: unknown[] };
+type CatalogOptions = { container?: string; languageOverrides?: Record<string, Record<string, string>> };
+export type TvCatalog = CatalogOptions & { kind?: 'tv'; show: string; season: number; reference: string; episodes: { episode: number; title: string }[]; seasonFolders: boolean };
+export type MovieCatalog = CatalogOptions & { kind: 'movies'; reference: string; movies: { file: string; title: string; year: number; reference: string }[] };
+export type Catalog = TvCatalog | MovieCatalog;
+export const isMovieCatalog = (catalog: Catalog): catalog is MovieCatalog => catalog.kind === 'movies';
+export type Item = { source: string; target: string; title: string; sha256: string; probe: Probe; selected: number[]; metadata?: JellyfinMetadata };
 export type Plan = { version: 2; jobs: number; sourceRoot: string; destinationRoot: string; catalog: Catalog; items: Item[]; missing: string[]; existing: string[]; ignored: string[]; createdAt: string };
-type Receipt = { source: string; target: string; sourceSha256: string; outputSha256: string; fullDecode: true };
+type Receipt = { source: string; target: string; sourceSha256: string; outputSha256: string; metadataSha256?: string; fullDecode: true };
 type RunManifest = { version: 1; planSha256: string };
 type Checkpoint = { version: 1; planSha256: string; source: string; target: string; sourceSha256: string; tempDir: string; stage: 'working' | 'validated'; outputSha256?: string; fullDecode?: true };
 const videos = videoExtensions;
@@ -24,7 +31,7 @@ const within = (parent: string, child: string) => { const rel = relative(parent,
 const ident = (season: number, episode: number) => `S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
 
 async function exec(args: string[], logfile?: string): Promise<string> {
-  const command = args[0] === 'ffmpeg' ? ['nice', '-n', '15', ...args] : args;
+  const command = args[0] === 'ffmpeg' ? ffmpegCommand(args) : args;
   if (logfile) await writeFile(logfile, `$ ${command.map(a => JSON.stringify(a)).join(' ')}\n`, { flag: 'a' });
   const proc = Bun.spawn(command, { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' });
   let stderrTail = '', stdout = '';
@@ -120,12 +127,42 @@ export function ffmpegArgs(item: Item, output: string): string[] {
   }
   return [...args, '-f', p.muxer, output];
 }
+function validReference(value: unknown): boolean {
+  if (!text(value) || !value.trim()) return false;
+  try { const url = new URL(value); return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password; }
+  catch { return false; }
+}
+function sourceFilePath(file: unknown): file is string {
+  return text(file) && !!file && !file.startsWith('/') && !file.includes('\\') && !file.includes(':') && file.split('/').every(part => !!part && part !== '.' && part !== '..');
+}
+function movieTitle(title: string, year: number): string {
+  const clean = safeName(title);
+  return `${/^The\s+/i.test(clean) ? `${safeName(clean.replace(/^The\s+/i, ''))}, The` : clean} - ${year}`;
+}
 function catalogCheck(c: unknown): asserts c is Catalog {
-  if (!obj(c) || !text(c.show) || !text(c.reference) || !c.reference.trim() || !Number.isInteger(c.season) || (c.season as number) < 0 || (c.season as number) > 99 || typeof c.seasonFolders !== 'boolean' || !Array.isArray(c.episodes)) fail('Invalid catalog');
-  const catalog = c as unknown as Catalog;
-  let reference: URL;
-  try { reference = new URL(catalog.reference); } catch { throw new Error('Catalog requires an episode-list URL'); }
-  if (!['https:', 'http:'].includes(reference.protocol) || reference.username || reference.password || !catalog.episodes.length) fail('Catalog requires an episode-list URL and a nonempty episode list');
+  if (!obj(c)) throw new Error('Invalid catalog');
+  if (!validReference(c.reference)) fail('Invalid catalog reference URL');
+  const catalog = c as Catalog;
+  if (c.kind === 'movies') {
+    if (!Array.isArray(c.movies) || !c.movies.length) fail('Invalid movie catalog');
+    const files = new Set<string>(), titles = new Set<string>();
+    for (const movie of (catalog as MovieCatalog).movies) {
+      if (!obj(movie) || !sourceFilePath(movie.file) || !text(movie.title) || !movie.title.trim() || !Number.isInteger(movie.year) || (movie.year as number) < 1888 || (movie.year as number) > 2100 || !validReference(movie.reference)) fail('Invalid movie entry: file, title, year and reference required');
+      const file = (movie.file as string).toLowerCase(), title = movieTitle(movie.title as string, movie.year as number).toLowerCase();
+      if (files.has(file) || titles.has(title)) fail('Duplicate movie source or title/year');
+      files.add(file); titles.add(title);
+    }
+  } else {
+    if ((c.kind !== undefined && c.kind !== 'tv') || !text(c.show) || !Number.isInteger(c.season) || (c.season as number) < 0 || (c.season as number) > 99 || typeof c.seasonFolders !== 'boolean' || !Array.isArray(c.episodes) || !c.episodes.length) fail('Invalid TV catalog');
+    const tv = catalog as TvCatalog;
+    if (tv.show !== safeName(tv.show)) fail('Show must be a safe filename');
+    const seen = new Set<number>();
+    for (const ep of tv.episodes) {
+      if (!obj(ep) || !Number.isInteger(ep.episode) || (ep.episode as number) < 0 || (ep.episode as number) > 99 || !text(ep.title) || !ep.title.trim()) fail('Invalid catalog episode');
+      if (seen.has(ep.episode as number)) fail('Duplicate catalog episode');
+      seen.add(ep.episode as number); safeName(ep.title as string);
+    }
+  }
   if (catalog.container !== undefined && (!text(catalog.container) || catalog.container !== targetExtension('unused.mkv', catalog.container))) fail('Catalog container must be a supported lowercase extension such as .mp4');
   if (catalog.languageOverrides !== undefined) {
     if (!obj(catalog.languageOverrides)) fail('Invalid languageOverrides');
@@ -134,12 +171,30 @@ function catalogCheck(c: unknown): asserts c is Catalog {
       for (const [index, language] of Object.entries(overrides)) if (!/^(0|[1-9]\d*)$/.test(index) || !text(language) || !/^[a-z]{2,3}$/.test(language) || language === 'und') fail(`Invalid language override ${file}:${index}`);
     }
   }
-  if (catalog.show !== safeName(catalog.show)) fail('Show must be a safe filename');
-  const seen = new Set<number>();
-  for (const ep of catalog.episodes) {
-    if (!obj(ep) || !Number.isInteger(ep.episode) || (ep.episode as number) < 0 || (ep.episode as number) > 99 || !text(ep.title) || !ep.title.trim()) fail('Invalid catalog episode');
-    if (seen.has(ep.episode as number)) fail('Duplicate catalog episode');
-    seen.add(ep.episode as number); safeName(ep.title as string);
+}
+function expectedEntries(catalog: Catalog): Map<string, string> {
+  return isMovieCatalog(catalog)
+    ? new Map(catalog.movies.map(movie => [movieTitle(movie.title, movie.year).toLowerCase(), movieTitle(movie.title, movie.year)]))
+    : new Map(catalog.episodes.map(ep => [ident(catalog.season, ep.episode), `${catalog.show} - ${ident(catalog.season, ep.episode)} - ${safeName(ep.title)}`]));
+}
+function sourceIdentity(catalog: Catalog, root: string, path: string): string | null {
+  if (isMovieCatalog(catalog)) {
+    const key = relativeSource(root, path);
+    const movie = catalog.movies.find(entry => entry.file === key);
+    return movie ? movieTitle(movie.title, movie.year).toLowerCase() : null;
+  }
+  return episodeId(basename(path));
+}
+function destinationDirectory(catalog: Catalog, root: string): string {
+  return !isMovieCatalog(catalog) && catalog.seasonFolders ? join(root, `SEASON ${catalog.season}`) : root;
+}
+function destinationIdentity(catalog: Catalog, path: string): string | null {
+  return isMovieCatalog(catalog) ? basename(path, extname(path)).toLowerCase() : episodeId(basename(path));
+}
+async function rejectMovieFolders(catalog: Catalog, root: string): Promise<void> {
+  if (!isMovieCatalog(catalog)) return;
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (/^SEASON\s*\d+/i.test(entry.name) || (entry.isDirectory() && !entry.name.startsWith('.video-library-'))) fail(`Movie destination must be flat without TV/season folders: ${join(root, entry.name)}`);
   }
 }
 function relativeSource(root: string, source: string): string {
@@ -171,9 +226,14 @@ function planCheck(v: unknown): asserts v is Plan {
     if (!obj(i) || !text(i.source) || !isAbsolute(i.source) || !text(i.target) || !isAbsolute(i.target) || !text(i.title) || !text(i.sha256) || !shaPattern.test(i.sha256) || !Array.isArray(i.selected) || !i.selected.every((n: unknown) => Number.isInteger(n) && (n as number) >= 0) || !obj(i.probe) || !Array.isArray(i.probe.streams) || !obj(i.probe.format)) fail('Invalid plan item');
     if (!i.probe.streams.every((s: unknown) => obj(s) && Number.isInteger(s.index) && text(s.codec_type) && text(s.codec_name) && ['width', 'height', 'channels'].every(k => !(k in s) || Number.isInteger(s[k])) && (!('tags' in s) || (obj(s.tags) && Object.values(s.tags).every(text))) && (!('disposition' in s) || (obj(s.disposition) && Object.values(s.disposition).every(n => Number.isInteger(n)))))) fail('Invalid probe streams');
     if (i.probe.format.duration !== undefined && !text(i.probe.format.duration)) fail('Invalid duration');
+    if (i.probe.format.format_name !== undefined && !text(i.probe.format.format_name)) fail('Invalid source container');
     if (i.probe.format.tags !== undefined && (!obj(i.probe.format.tags) || !Object.values(i.probe.format.tags).every(text))) fail('Invalid format tags');
     if (i.probe.chapters !== undefined && !Array.isArray(i.probe.chapters)) fail('Invalid chapters');
     containerProfile(extname(i.target));
+    if (i.metadata !== undefined) {
+      const normalized = parseJellyfinMetadata(JSON.stringify(i.metadata));
+      if (JSON.stringify(canonical(normalized)) !== JSON.stringify(canonical(i.metadata))) fail('Noncanonical metadata; regenerate the plan');
+    }
   }
 }
 export async function loadPlan(path: string): Promise<Plan> { const v: unknown = JSON.parse(await readFile(path, 'utf8')); planCheck(v); planMapping(v); return v; }
@@ -203,8 +263,7 @@ async function targetSafe(root: string, target: string): Promise<void> {
 export async function spaceBudget(items: Item[], destinationRoot: string, jobs?: number | string): Promise<{ requiredFreeBytes: number; availableFreeBytes: number }> {
   const sizes = await runQueue(items, resolveJobs(jobs), async item => (await stat(item.source)).size);
   const requiredFreeBytes = Math.ceil(sizes.reduce((sum, size) => sum + size, 0) * 1.1 + 64 * 1024 * 1024);
-  const space = await statfs(destinationRoot);
-  const availableFreeBytes = space.bavail * space.bsize;
+  const availableFreeBytes = await availableBytes(destinationRoot);
   if (availableFreeBytes < requiredFreeBytes) fail('Insufficient free destination space');
   return { requiredFreeBytes, availableFreeBytes };
 }
@@ -214,31 +273,31 @@ export async function makePlan(sourceRoot: string, destinationRoot: string, cata
   const [src, dst] = await roots(sourceRoot, destinationRoot);
   const sources = await scan(src);
   checkOverrideFiles(catalog, src, sources.files);
-  const seasonDir = catalog.seasonFolders ? join(dst, `SEASON ${catalog.season}`) : dst;
-  if (catalog.seasonFolders) {
+  await rejectMovieFolders(catalog, dst);
+  const seasonDir = destinationDirectory(catalog, dst);
+  if (!isMovieCatalog(catalog) && catalog.seasonFolders) {
     try { const dir = await lstat(seasonDir); if (!dir.isDirectory() || dir.isSymbolicLink()) fail(`Unsafe season directory: ${seasonDir}`); }
     catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
   }
   const existingScan = await scan(seasonDir).catch(e => { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return { files: [], ignored: [] }; throw e; });
-  const known = new Map(catalog.episodes.map(e => [ident(catalog.season, e.episode), e]));
+  const known = expectedEntries(catalog);
   const existingIds = new Set<string>(), seenExisting = new Set<string>(), sourceIds = new Set<string>(), existing: string[] = [], ignoredDestination: string[] = [], outputNames = new Set<string>();
   const siblingNames = new Map<string, Set<string>>();
   for (const path of existingScan.files) {
-    const id = episodeId(basename(path));
-    if (!id) throw new Error(`Unknown video in selected season: ${path}`);
-    if (!catalog.seasonFolders && Number(id.slice(1, 3)) !== catalog.season) { ignoredDestination.push(path); continue; }
+    const id = destinationIdentity(catalog, path);
+    if (id === null) throw new Error(`Unknown video in selected library: ${path}`);
+    if (!isMovieCatalog(catalog) && / - \d{4}$/i.test(basename(path, extname(path)))) fail(`Movie in TV destination: ${path}`);
+    if (!isMovieCatalog(catalog) && !catalog.seasonFolders && Number(id.slice(1, 3)) !== catalog.season) { ignoredDestination.push(path); continue; }
     if (!known.has(id)) throw new Error(`Out-of-catalog video in selected season: ${path}`);
-    if (seenExisting.has(id)) fail(`Duplicate existing episode: ${id}`);
-    seenExisting.add(id); existingIds.add(id); existing.push(id);
+    if (seenExisting.has(id)) fail(`Duplicate existing entry: ${id}`);
+    seenExisting.add(id); existingIds.add(id); existing.push(isMovieCatalog(catalog) ? known.get(id)! : id);
   }
   for (const path of sources.files) {
-    const id = episodeId(basename(path));
-    if (!id) throw new Error(`Unparseable episode: ${path}`);
-    if (!known.has(id)) fail(`Out-of-catalog episode: ${path}`);
-    if (sourceIds.has(id) || existingIds.has(id)) fail(`Duplicate/colliding episode: ${id}`);
+    const id = sourceIdentity(catalog, src, path);
+    if (id === null || !known.has(id)) throw new Error(`Out-of-catalog source: ${path}`);
+    if (sourceIds.has(id) || existingIds.has(id)) fail(`Duplicate/colliding entry: ${id}`);
     sourceIds.add(id);
-    const ep = known.get(id)!;
-    const title = `${catalog.show} - ${id} - ${safeName(ep.title)}`;
+    const title = known.get(id)!;
     const target = join(seasonDir, `${title}${targetExtension(path, catalog.container)}`);
     const key = target.toLowerCase();
     if (outputNames.has(key) || [...existingScan.files, ...existingScan.ignored].some(f => f.toLowerCase() === key)) fail(`Case-insensitive target collision: ${target}`);
@@ -251,29 +310,28 @@ export async function makePlan(sourceRoot: string, destinationRoot: string, cata
     outputNames.add(key);
   }
   const items = await runQueue(sources.files, workers, async path => {
-    const id = episodeId(basename(path))!;
-    const ep = known.get(id)!;
-    const title = `${catalog.show} - ${id} - ${safeName(ep.title)}`;
+    const id = sourceIdentity(catalog, src, path)!;
+    const title = known.get(id)!;
     const target = join(seasonDir, `${title}${targetExtension(path, catalog.container)}`);
     await sourceSafe({ sourceRoot: src } as Plan, { source: path } as Item);
     await targetSafe(dst, target);
     const [p, hash] = await Promise.all([probe(path), sha256(path)]);
+    checkSourceContainer(path, p);
     const item = { source: path, target, title, sha256: hash, probe: p, selected: [] as number[] };
     item.selected = chooseStreams(effectiveProbe({ sourceRoot: src, catalog } as Plan, item));
     checkContainer(containerProfile(extname(target)), p, item.selected);
     return item;
   });
-  return { version: 2, jobs: workers, sourceRoot: src, destinationRoot: dst, catalog, items, missing: [...known.keys()].filter(id => !sourceIds.has(id) && !existingIds.has(id)), existing: existing.sort(), ignored: [...sources.ignored, ...ignoredDestination], createdAt: new Date().toISOString() };
+  return { version: 2, jobs: workers, sourceRoot: src, destinationRoot: dst, catalog, items, missing: [...known].filter(([id]) => !sourceIds.has(id) && !existingIds.has(id)).map(([id, title]) => isMovieCatalog(catalog) ? title : id), existing: existing.sort(), ignored: [...sources.ignored, ...ignoredDestination], createdAt: new Date().toISOString() };
 }
 function planMapping(plan: Plan): void {
   checkOverrideFiles(plan.catalog, plan.sourceRoot, plan.items.map(item => item.source));
   const sources = new Set<string>(), targets = new Set<string>();
   for (const item of plan.items) {
-    const id = episodeId(basename(item.source));
-    const ep = plan.catalog.episodes.find(e => id === ident(plan.catalog.season, e.episode));
-    if (!ep) throw new Error(`Unknown episode in plan: ${item.source}`);
-    const title = `${plan.catalog.show} - ${id} - ${safeName(ep.title)}`;
-    const target = join(plan.destinationRoot, ...(plan.catalog.seasonFolders ? [`SEASON ${plan.catalog.season}`] : []), `${title}${targetExtension(item.source, plan.catalog.container)}`);
+    const id = sourceIdentity(plan.catalog, plan.sourceRoot, item.source);
+    const title = id && expectedEntries(plan.catalog).get(id);
+    if (!title) throw new Error(`Unknown source in plan: ${item.source}`);
+    const target = join(destinationDirectory(plan.catalog, plan.destinationRoot), `${title}${targetExtension(item.source, plan.catalog.container)}`);
     if (item.title !== title || item.target !== target || JSON.stringify(item.selected) !== JSON.stringify(chooseStreams(effectiveProbe(plan, item)))) fail(`Invalid item mapping: ${item.source}`);
     checkContainer(containerProfile(extname(target)), item.probe, item.selected);
     if (sources.has(item.source) || targets.has(item.target.toLowerCase())) fail('Duplicate plan item');
@@ -284,6 +342,7 @@ function receiptPath(runDir: string, item: Item) { return join(runDir, `item-${c
 async function receipt(runDir: string, item: Item): Promise<Receipt> {
   const r: unknown = JSON.parse(await readFile(receiptPath(runDir, item), 'utf8'));
   if (!obj(r) || r.source !== item.source || r.target !== item.target || r.sourceSha256 !== item.sha256 || !text(r.outputSha256) || !shaPattern.test(r.outputSha256) || r.fullDecode !== true) fail(`Invalid receipt for ${item.source}`);
+  if (item.metadata && (r as Receipt).metadataSha256 !== metadataHash(item.metadata)) fail(`Invalid metadata receipt for ${item.source}`);
   return r as Receipt;
 }
 async function sourceSafe(plan: Plan, item: Item, allowMissing = false): Promise<boolean> {
@@ -329,20 +388,6 @@ async function validateOutput(item: Item, output: string, log: string, decode = 
   const before = Number(item.probe.format.duration), after = Number(got.format.duration);
   if (!Number.isFinite(before) || !Number.isFinite(after) || Math.abs(before - after) > 2) fail(`Duration discrepancy ${before}s vs ${after}s: ${output}; review subtitle tails or source`);
   if (decode) await exec(['ffmpeg', '-nostdin', '-v', 'error', '-xerror', '-err_detect', 'explode', '-i', output, '-map', '0:v', '-map', '0:a', '-f', 'null', '-'], log);
-}
-async function syncDirectories(start: string, stop: string = sep): Promise<void> {
-  let dir = start;
-  while (true) {
-    const handle = await open(dir, 'r');
-    try { await handle.sync(); } finally { await handle.close(); }
-    if (dir === stop || dir === dirname(dir)) return;
-    dir = dirname(dir);
-  }
-}
-async function durableOutput(path: string, root: string): Promise<void> {
-  const handle = await open(path, 'r');
-  try { await handle.sync(); } finally { await handle.close(); }
-  await syncDirectories(dirname(path), root);
 }
 export const digestPlan = (plan: Plan): string => createHash('sha256').update(JSON.stringify(canonical(plan))).digest('hex');
 function canonical(value: unknown): unknown {
@@ -410,7 +455,7 @@ async function validateApplyInputs(plan: Plan, runDir: string, digest: string, j
   const expectedSources = new Map(plan.items.map(item => [item.source, item]));
   const sourceIds = new Set<string>();
   for (const path of sources.files) {
-    const id = episodeId(basename(path));
+    const id = sourceIdentity(plan.catalog, plan.sourceRoot, path);
     if (!id || !expectedSources.has(path) || sourceIds.has(id)) throw new Error(`New, duplicate or unplanned source: ${path}`);
     sourceIds.add(id);
   }
@@ -422,26 +467,33 @@ async function validateApplyInputs(plan: Plan, runDir: string, digest: string, j
       if (hash !== item.sha256 || JSON.stringify(canonical(currentProbe)) !== JSON.stringify(canonical(item.probe)) || JSON.stringify(chooseStreams(effectiveProbe(plan, { ...item, probe: currentProbe }))) !== JSON.stringify(item.selected)) fail(`Source changed: ${item.source}`);
     }
     const r = records.get(item.source)!;
-    if (r.done) await checkedOutput(plan, item, r.done.outputSha256, itemLog(runDir, item));
+    await metadataTargetSafe(plan, item, Boolean(r.done || r.checkpoint?.stage === 'validated'));
+    if (r.done) {
+      await checkedOutput(plan, item, r.done.outputSha256, itemLog(runDir, item));
+      await checkedMetadata(plan, item);
+    }
   });
-  const seasonDir = plan.catalog.seasonFolders ? join(plan.destinationRoot, `SEASON ${plan.catalog.season}`) : plan.destinationRoot;
+  await rejectMovieFolders(plan.catalog, plan.destinationRoot);
+  const seasonDir = destinationDirectory(plan.catalog, plan.destinationRoot);
   const destination = await scan(seasonDir).catch(e => { if (missing(e)) return { files: [], ignored: [] }; throw e; });
   const ids = new Set<string>(), existing = new Set<string>(), targets = new Map(plan.items.map(item => [item.target.toLowerCase(), item]));
-  const plannedIds = new Set(plan.items.map(item => episodeId(basename(item.target))));
+  const known = expectedEntries(plan.catalog);
+  const plannedIds = new Set(plan.items.map(item => destinationIdentity(plan.catalog, item.target)));
   for (const path of destination.files) {
-    const id = episodeId(basename(path));
-    if (!id) throw new Error(`Unknown video in selected season: ${path}`);
-    if (!plan.catalog.seasonFolders && Number(id.slice(1, 3)) !== plan.catalog.season) continue;
-    if (!plan.catalog.episodes.some(ep => id === ident(plan.catalog.season, ep.episode)) || ids.has(id)) fail(`Unknown or duplicate destination episode: ${path}`);
+    const id = destinationIdentity(plan.catalog, path);
+    if (!id) throw new Error(`Unknown video in selected library: ${path}`);
+    if (!isMovieCatalog(plan.catalog) && / - \d{4}$/i.test(basename(path, extname(path)))) fail(`Movie in TV destination: ${path}`);
+    if (!isMovieCatalog(plan.catalog) && !plan.catalog.seasonFolders && Number(id.slice(1, 3)) !== plan.catalog.season) continue;
+    if (!known.has(id) || ids.has(id)) fail(`Unknown or duplicate destination entry: ${path}`);
     ids.add(id);
     if (plannedIds.has(id)) {
       const item = targets.get(path.toLowerCase());
       if (!item || item.target !== path || !(records.get(item.source)?.done || records.get(item.source)?.checkpoint?.stage === 'validated')) throw new Error(`Foreign destination collision: ${path}`);
       const r = records.get(item.source)!;
       if (!r.done) await checkedOutput(plan, item, r.checkpoint!.outputSha256!, itemLog(runDir, item));
-    } else existing.add(id);
+    } else existing.add(isMovieCatalog(plan.catalog) ? known.get(id)! : id);
   }
-  if (JSON.stringify([...existing].sort()) !== JSON.stringify([...plan.existing].sort()) || JSON.stringify(plan.catalog.episodes.map(ep => ident(plan.catalog.season, ep.episode)).filter(id => !ids.has(id) && !plannedIds.has(id)).sort()) !== JSON.stringify([...plan.missing].sort())) fail('Destination completeness changed');
+  if (JSON.stringify([...existing].sort()) !== JSON.stringify([...plan.existing].sort()) || JSON.stringify([...known].filter(([id]) => !ids.has(id) && !plannedIds.has(id)).map(([id, title]) => isMovieCatalog(plan.catalog) ? title : id).sort()) !== JSON.stringify([...plan.missing].sort())) fail('Destination completeness changed');
   const siblings = new Map<string, Set<string>>();
   for (const item of plan.items) {
     await targetSafeAncestors(plan.destinationRoot, item.target);
@@ -458,17 +510,57 @@ async function targetSafeAncestors(root: string, target: string): Promise<void> 
     catch (e) { if (!missing(e)) throw e; }
   }
 }
+async function metadataTargetSafe(plan: Plan, item: Item, allowExisting: boolean): Promise<void> {
+  if (!item.metadata) return;
+  const target = metadataPath(item);
+  await targetSafeAncestors(plan.destinationRoot, target);
+  const names = await readdir(dirname(target)).catch(error => { if (missing(error)) return []; throw error; });
+  const collisions = names.filter(name => name.toLowerCase() === basename(target).toLowerCase());
+  if (collisions.some(name => name !== basename(target))) fail(`Case-insensitive metadata collision: ${target}`);
+  if (collisions.length) {
+    if (!allowExisting || !(await exists(item.target))) fail(`Foreign metadata collision: ${target}`);
+    await checkedMetadata(plan, item);
+  }
+}
+async function checkedMetadata(plan: Plan, item: Item): Promise<void> {
+  if (!item.metadata) return;
+  const path = metadataPath(item);
+  await publishedSafe(plan, { ...item, target: path });
+  if (await sha256(path) !== metadataHash(item.metadata)) fail(`Metadata hash mismatch: ${path}`);
+}
+async function publishMetadata(plan: Plan, item: Item, checkpoint: Checkpoint, log: string): Promise<void> {
+  if (!item.metadata) return;
+  const target = metadataPath(item);
+  await metadataTargetSafe(plan, item, true);
+  if (!(await exists(target))) {
+    await targetSafeAncestors(plan.destinationRoot, join(checkpoint.tempDir, 'metadata.nfo'));
+    await mkdir(checkpoint.tempDir, { recursive: true });
+    const dir = await mkdtemp(join(checkpoint.tempDir, '.metadata-'));
+    const partial = join(dir, 'metadata.nfo');
+    await writeFile(partial, renderNfo(item.metadata), { flag: 'wx' });
+    await durableOutput(partial, plan.destinationRoot);
+    await exec(publicationCommand(partial, target), log);
+  }
+  await checkedMetadata(plan, item);
+  await durableOutput(target, plan.destinationRoot);
+}
 async function finish(item: Item, plan: Plan, runDir: string, checkpoint: Checkpoint): Promise<void> {
   await checkedOutput(plan, item, checkpoint.outputSha256!, itemLog(runDir, item));
   await durableOutput(item.target, plan.destinationRoot);
   const path = receiptPath(runDir, item);
-  if (await exists(path)) await receipt(runDir, item);
-  else await atomicRecord(path, { source: item.source, target: item.target, sourceSha256: item.sha256, outputSha256: checkpoint.outputSha256, fullDecode: true });
+  if (await exists(path)) {
+    await receipt(runDir, item);
+    await checkedMetadata(plan, item);
+  } else {
+    await publishMetadata(plan, item, checkpoint, itemLog(runDir, item));
+    await atomicRecord(path, { source: item.source, target: item.target, sourceSha256: item.sha256, outputSha256: checkpoint.outputSha256, ...(item.metadata ? { metadataSha256: metadataHash(item.metadata) } : {}), fullDecode: true });
+  }
   if (await exists(checkpoint.tempDir)) await rm(checkpoint.tempDir, { recursive: true });
   await unlink(checkpointPath(runDir, item));
   await syncDirectories(runDir);
 }
 async function work(item: Item, plan: Plan, runDir: string, digest: string, record: { done?: Receipt; checkpoint?: Checkpoint }, dev: number): Promise<void> {
+  await metadataTargetSafe(plan, item, Boolean(record.done || record.checkpoint?.stage === 'validated'));
   if (record.done) {
     console.error(`skip ${basename(item.target)}`);
     if (record.checkpoint) await finish(item, plan, runDir, record.checkpoint);
@@ -501,13 +593,15 @@ async function work(item: Item, plan: Plan, runDir: string, digest: string, reco
   if (!(await sourceSafe(plan, item)) || await sha256(item.source) !== item.sha256) fail(`Source changed before publication: ${item.source}`);
   if (await realpath(plan.destinationRoot) !== plan.destinationRoot || (await stat(plan.destinationRoot)).dev !== dev) fail('Destination mount/root changed before publication');
   await targetSafeAncestors(plan.destinationRoot, item.target);
-  if (!(await exists(item.target))) {
+  const published = await exists(item.target);
+  await metadataTargetSafe(plan, item, published);
+  if (!published) {
     const partial = join(checkpoint.tempDir, `output.partial${extname(item.target)}`);
     if (!(await exists(partial))) fail(`Validated partial missing: ${partial}`);
     const st = await lstat(partial);
     if (!st.isFile() || st.isSymbolicLink() || await sha256(partial) !== checkpoint.outputSha256) fail(`Validated partial changed: ${partial}`);
     await validateOutput(item, partial, log, false);
-    try { await exec(['mv', '--no-copy', '--update=none-fail', '--no-target-directory', '--', partial, item.target], log); }
+    try { await exec(publicationCommand(partial, item.target), log); }
     catch (e) { if (!(await exists(item.target)) || await sha256(item.target) !== checkpoint.outputSha256) throw e; }
   }
   await finish(item, plan, runDir, checkpoint);
@@ -544,7 +638,11 @@ async function verifiedItem(plan: Plan, runDir: string, item: Item, fullDecode: 
   if (await sha256(item.target) !== r.outputSha256) fail(`Output hash mismatch: ${item.target}`);
   if (await sourceSafe(plan, item, true) && await sha256(item.source) !== item.sha256) fail(`Source hash mismatch: ${item.source}`);
   await validateOutput(item, item.target, itemLog(runDir, item, 'verify'), fullDecode);
-  if (durable) await durableOutput(item.target, plan.destinationRoot);
+  await checkedMetadata(plan, item);
+  if (durable) {
+    await durableOutput(item.target, plan.destinationRoot);
+    if (item.metadata) await durableOutput(metadataPath(item), plan.destinationRoot);
+  }
 }
 export async function verifyPlan(plan: Plan, runDir: string, fullDecode = false, jobs?: number | string): Promise<void> {
   const workers = approvedJobs(plan, jobs);
@@ -556,6 +654,7 @@ export async function verifyPlan(plan: Plan, runDir: string, fullDecode = false,
 }
 export async function cleanupSources(plan: Plan, runDir: string, jobs?: number | string, confirmedTransfer = false): Promise<void> {
   if (!confirmedTransfer) fail('Source deletion requires user confirmation of successful transfer');
+  assertCleanupDurability();
   const workers = approvedJobs(plan, jobs);
   await withRunLock(runDir, async () => {
     await checkRoots(plan);

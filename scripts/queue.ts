@@ -1,7 +1,17 @@
 import { readFileSync, readdirSync } from "node:fs";
 
-/** Return 1 when Linux topology or process affinity cannot be read; never equate logical CPUs with cores. */
+/** Return 1 when hardware topology cannot be read; never equate logical CPUs with cores. */
 export function physicalCoreCount(): number {
+  if (process.platform === "win32") {
+    try {
+      const result = Bun.spawnSync(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', '(Get-CimInstance -ClassName Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum'], {
+        stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 5000,
+      });
+      const output = result.stdout.toString().trim();
+      const count = Number(output);
+      return result.exitCode === 0 && /^\d+$/.test(output) && Number.isSafeInteger(count) && count > 0 ? count : 1;
+    } catch { return 1; }
+  }
   if (process.platform !== "linux") return 1;
   try {
     const allowed = readFileSync("/proc/self/status", "utf8").match(/^Cpus_allowed_list:\s*(.+)$/m)?.[1];

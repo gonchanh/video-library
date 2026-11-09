@@ -11,10 +11,15 @@
   },
   "devDependencies": {
     "@types/bun": "1.4.4",
-    "oxlint": "^1.92.0"
+    "oxlint": "^1.93.0",
+    "oxlint-tsgolint": "^7.0.2006"
   },
   "module": "index.ts",
   "peerDependencies": {
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@boundaryml/baml-bridge": "0.25.2",
+    "@lorenzopant/tmdb": "^2.2.0"
   }
 }

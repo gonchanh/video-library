@@ -39,6 +39,15 @@ describe("resolveJobs", () => {
     }
   });
 
+  test('counts Windows physical cores from Win32_Processor rather than logical CPUs', () => {
+    if (process.platform !== 'win32') return;
+    const result = Bun.spawnSync(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', '(Get-CimInstance -ClassName Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum'], {
+      stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 5000,
+    });
+    const count = Number(result.stdout.toString().trim());
+    expect(physicalCoreCount()).toBe(result.exitCode === 0 && Number.isSafeInteger(count) && count > 0 ? count : 1);
+  });
+
   test("rejects invalid job limits", () => {
     for (const value of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "", "  ", "0", "-2", "1.5", "nope", "auto "]) {
       expect(() => resolveJobs(value)).toThrow();

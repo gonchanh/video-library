@@ -35,6 +35,11 @@ export function containerProfile(extension: string): ContainerProfile {
   return p;
 }
 export const videoExtensions = new Set(Object.keys(profiles));
+export function checkSourceContainer(source: string, probe: Probe): void {
+  const expected = containerProfile(extname(source)).muxer;
+  const actual = probe.format.format_name?.split(',') ?? [];
+  if (!actual.includes(expected)) throw new Error(`Source extension disagrees with its probed container: ${source}; resolve the format before planning`);
+}
 export function targetExtension(source: string, override?: string): string {
   const extension = override === undefined ? extname(source).toLowerCase() : override.toLowerCase();
   containerProfile(extension);

@@ -1,6 +1,10 @@
 [package]
 name = "video-library"
 
+[generator.client1]
+output_type = "typescript/node"
+naming_convention = "preserve-case"
+
 # [scripts]
 # dev = "-f main"
 

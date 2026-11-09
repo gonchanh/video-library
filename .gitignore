@@ -2,4 +2,6 @@ node_modules/
 *.partial.mkv
 plan.md
 .baml/**
-.env
+.env*
+!.env.example
+/baml_sdk/

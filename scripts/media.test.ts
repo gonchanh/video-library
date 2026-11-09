@@ -63,12 +63,42 @@ describe("selection and naming", () => {
 
 let temp: string;
 let fixture: string;
+let compiledFaultTool: string;
 const catalog: Catalog = { show: "Test Show", season: 1, reference: "https://example.org/episodes", seasonFolders: false, episodes: [{ episode: 1, title: "Pilot" }, { episode: 2, title: "Second" }] };
 
 beforeAll(async () => {
   checkExternalDependencies();
   temp = await mkdtemp(join(tmpdir(), "video-library-test-"));
   fixture = join(temp, "fixture.mkv");
+  if (process.platform === 'win32') {
+    const script = join(temp, 'fault-shim.ts');
+    compiledFaultTool = join(temp, 'fault-shim.exe');
+    await writeFile(script, `import { readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+const config = JSON.parse(readFileSync(join(dirname(process.argv[0]), 'fault.json'), 'utf8'));
+const args = process.argv.slice(1);
+const encoded = args[args.indexOf('-EncodedCommand') + 1];
+const command = encoded ? Buffer.from(encoded, 'base64').toString('utf16le') : '';
+const publication = command.includes('EntryPoint="MoveFileExW"');
+const paths = [...command.matchAll(/FromBase64String\\('([A-Za-z0-9+/=]*)'\\)/g)].map(match => Buffer.from(match[1], 'base64').toString('utf16le'));
+function killParent() { process.kill(process.ppid, 'SIGKILL'); }
+if (config.mode === 'move-fail' && publication || config.mode === 'move-second' && publication && paths.some(path => path.includes('S01E02'))) {
+  console.error('simulated publication interruption'); process.exit(42);
+}
+if (config.mode === 'remux' && args.some((arg, i) => arg === '-c' && args[i + 1] === 'copy') ||
+    config.mode === 'decode' && args.some((arg, i) => arg === '-f' && args[i + 1] === 'null')) {
+  if (config.mode === 'remux') writeFileSync(args[args.length - 1], 'incomplete output');
+  killParent(); process.exit(42);
+}
+const result = Bun.spawnSync([config.real, ...args], { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', timeout: 45000 });
+process.stdout.write(result.stdout);
+process.stderr.write(result.stderr);
+if (result.exitCode !== 0) process.exit(result.exitCode || 1);
+if (config.mode === 'move-kill' && publication) killParent();
+`);
+    const built = Bun.spawnSync([process.execPath, 'build', '--compile', script, '--outfile', compiledFaultTool], { stdout: 'pipe', stderr: 'pipe', timeout: 60000 });
+    if (built.exitCode !== 0) throw new Error(`Cannot build Windows fault fixture: ${built.stderr.toString()}`);
+  }
   const sub = join(temp, "English.srt");
   await writeFile(sub, "1\n00:00:00,000 --> 00:00:00,700\nHello\n");
   const chapters = join(temp, "chapters.ffmeta");
@@ -169,11 +199,16 @@ describe("real FFmpeg workflow", () => {
     expect(unconfirmed.exitCode).not.toBe(0);
     expect(unconfirmed.stderr.toString()).toContain("--confirm-transfer");
     expect(await Bun.file(input).exists()).toBe(true);
-    await cleanupSources(plan, run, undefined, true);
-    expect(await Bun.file(input).exists()).toBe(false);
+    if (process.platform === 'win32') {
+      await expect(cleanupSources(plan, run, undefined, true)).rejects.toThrow('unavailable on Windows');
+      expect(await Bun.file(input).exists()).toBe(true);
+    } else {
+      await cleanupSources(plan, run, undefined, true);
+      expect(await Bun.file(input).exists()).toBe(false);
+      await cleanupSources(plan, run, undefined, true);
+    }
     expect(await Bun.file(sidecar).text()).toBe("keep");
     expect(await Bun.file(plan.items[0].target).exists()).toBe(true);
-    await cleanupSources(plan, run, undefined, true);
   }, 60000);
   test("corrupted output blocks cleanup without deleting source", async () => {
     const { source, dest, run, input } = await setup();
@@ -206,7 +241,7 @@ describe("real FFmpeg workflow", () => {
     await verifyPlan(plan, run, true);
     const log = (await readdir(run)).find(p => p.startsWith("verify-") && p.endsWith(".log"));
     expect(log).toBeDefined();
-    expect(await Bun.file(join(run, log!)).text()).toContain('"nice" "-n" "15" "ffmpeg"');
+    expect(await Bun.file(join(run, log!)).text()).toContain(process.platform === 'win32' ? '"ffmpeg"' : '"nice" "-n" "15" "ffmpeg"');
   }, 60000);
   test("preflights every receipt before deleting any source", async () => {
     const { source, dest, run, input } = await setup();
@@ -269,7 +304,7 @@ describe("real FFmpeg workflow", () => {
     const c = { ...catalog, seasonFolders: true };
     const plan = await makePlan(source, dest, c);
     const elsewhere = join(base, "elsewhere"); await mkdir(elsewhere);
-    await symlink(elsewhere, join(dest, "SEASON 1"));
+    await symlink(elsewhere, join(dest, "SEASON 1"), process.platform === 'win32' ? 'junction' : 'dir');
     await expect(applyPlan(plan, run, 1)).rejects.toThrow();
     expect(await readdir(elsewhere)).toEqual([]);
   }, 60000);
@@ -301,10 +336,16 @@ function avPacketHashes(path: string) {
   return result.stdout.toString().trim();
 }
 
-async function toolShim(base: string, tool: string, body: string) {
+async function toolShim(base: string, tool: string, body: string, windowsMode?: string) {
   const bin = join(base, "test-tools");
   await mkdir(bin, { recursive: true });
-  await writeFile(join(bin, tool), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+  if (process.platform === 'win32') {
+    if (!windowsMode) throw new Error('Windows fault mode required');
+    const real = Bun.which(tool);
+    if (!real) throw new Error(`Missing ${tool} for fault fixture`);
+    await copyFile(compiledFaultTool, join(bin, tool));
+    await writeFile(join(bin, 'fault.json'), JSON.stringify({ mode: windowsMode, real }));
+  } else await writeFile(join(bin, tool), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
   return `${bin}${delimiter}${process.env.PATH ?? ""}`;
 }
 
@@ -312,7 +353,7 @@ async function interruptedPublish() {
   const ctx = await setup();
   const plan = await makePlan(ctx.source, ctx.dest, catalog);
   const path = await savePlan(ctx.base, plan);
-  const shim = await toolShim(ctx.base, "mv", 'printf "%s\\n" "simulated publication interruption" >&2\nexit 42');
+  const shim = await toolShim(ctx.base, process.platform === 'win32' ? 'powershell.exe' : 'mv', 'printf "%s\\n" "simulated publication interruption" >&2\nexit 42', 'move-fail');
   const failed = applyCLI(path, ctx.run, false, shim);
   expect(failed.exitCode).not.toBe(0);
   const checkpointPath = join(ctx.run, (await checkpointNames(ctx.run))[0]);
@@ -346,7 +387,7 @@ describe("resume and interruption integrity", () => {
     const plan = await makePlan(source, dest, catalog);
     const path = await savePlan(base, plan);
     const mv = JSON.stringify(Bun.which("mv")!);
-    const shim = await toolShim(base, "mv", `case "$*" in *S01E02*) exit 42;; esac\nexec ${mv} "$@"`);
+    const shim = await toolShim(base, process.platform === 'win32' ? 'powershell.exe' : 'mv', `case "$*" in *S01E02*) exit 42;; esac\nexec ${mv} "$@"`, 'move-second');
     expect(applyCLI(path, run, false, shim).exitCode).not.toBe(0);
     expect(await receiptNames(run)).toHaveLength(1);
     const firstStat = await fileStat(plan.items[0].target);
@@ -371,7 +412,7 @@ describe("resume and interruption integrity", () => {
       const match = stage === "remux" ? '*"-c copy"*' : '*"-f null -"*';
       const truncate = stage === "remux" ? 'for last do :; done\nprintf "incomplete output" > "$last"\n' : "";
       // The shim's parent is only the isolated CLI subprocess, never this test runner.
-      const shim = await toolShim(base, "ffmpeg", `case "$*" in ${match})\n${truncate}kill -KILL "$PPID"\nexit 0;;\nesac\nexec ${ffmpeg} "$@"`);
+      const shim = await toolShim(base, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg', `case "$*" in ${match})\n${truncate}kill -KILL "$PPID"\nexit 0;;\nesac\nexec ${ffmpeg} "$@"`, stage);
       expect(applyCLI(path, run, false, shim).exitCode).not.toBe(0);
       const checkpoint = await Bun.file(join(run, (await checkpointNames(run))[0])).json();
       expect(checkpoint.stage).toBe("working");
@@ -391,7 +432,7 @@ describe("resume and interruption integrity", () => {
     const plan = await makePlan(source, dest, catalog);
     const path = await savePlan(base, plan);
     const mv = JSON.stringify(Bun.which("mv")!);
-    const shim = await toolShim(base, "mv", `${mv} "$@" || exit $?\nkill -KILL "$PPID"\nexit 0`);
+    const shim = await toolShim(base, process.platform === 'win32' ? 'powershell.exe' : 'mv', `${mv} "$@" || exit $?\nkill -KILL "$PPID"\nexit 0`, 'move-kill');
     expect(applyCLI(path, run, false, shim).exitCode).not.toBe(0);
     expect(await receiptNames(run)).toHaveLength(0);
     const checkpoint = await Bun.file(join(run, (await checkpointNames(run))[0])).json();
@@ -458,7 +499,7 @@ describe("resume and interruption integrity", () => {
     await rm(join(run, "run.json"));
     const shortened = { ...plan, items: [plan.items[0]] };
     await expect(verifyPlan(shortened, run)).rejects.toThrow("Missing run manifest");
-    await expect(cleanupSources(shortened, run, undefined, true)).rejects.toThrow("Missing run manifest");
+    await expect(cleanupSources(shortened, run, undefined, true)).rejects.toThrow(process.platform === 'win32' ? 'unavailable on Windows' : 'Missing run manifest');
     expect(await sha256(input)).toBe(plan.items[0].sha256);
     expect(await sha256(second)).toBe(plan.items[1].sha256);
   }, 60000);
