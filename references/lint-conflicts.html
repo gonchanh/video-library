@@ -1,0 +1,620 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Lint choices · video-library</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #111c2d; --panel: #162338; --code: #101a2a;
+      --line: #35465d; --text: #e6edf7; --muted: #a8b7cb;
+      --native: #9ec6ff; --fp: #d0baff; --bun: #f1ce95;
+      --pass: #a3d5c3; --fail: #f2b0bf;
+      --sans: Cantarell, "Segoe UI", sans-serif;
+      --mono: Iosevka, "Cascadia Code", "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-padding-top: 110px; }
+    body { margin: 0; background: var(--ink); color: var(--text); font: 15px/1.55 var(--sans); }
+    button, input { font: inherit; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    a { color: var(--native); text-underline-offset: 4px; }
+    button { cursor: pointer; }
+    button:focus-visible, a:focus-visible, summary:focus-visible, pre:focus-visible, textarea:focus-visible {
+      outline: 2px solid var(--native); outline-offset: 5px;
+    }
+    button { color: var(--text); background: transparent; border: 1px solid var(--line); border-radius: 5px; padding: 8px 13px; }
+    button:hover { background: #23334b; border-color: #647991; }
+    button[aria-pressed="true"] { background: #2d3c55; border-color: var(--text); }
+    .skip { position: fixed; top: -80px; left: 16px; padding: 10px; background: var(--panel); z-index: 5; }
+    .skip:focus { top: 12px; }
+    .masthead { position: sticky; top: 0; z-index: 3; background: #111c2df5; border-bottom: 1px solid var(--line); }
+    .masthead-inner { max-width: 1680px; margin: auto; padding: 14px 32px; display: flex; align-items: center; gap: 18px; }
+    .brand { font-size: 17px; font-weight: 700; letter-spacing: -.4px; color: var(--text); text-decoration: none; }
+    .brand-symbol { color: var(--fp); margin-right: 10px; font: 19px var(--mono); }
+    .project { color: var(--muted); padding-left: 18px; border-left: 1px solid var(--line); }
+    .actions { display: flex; align-items: center; gap: 20px; margin-left: auto; }
+    .actions a { font-size: 13px; }
+    .actions button { font-size: 13px; }
+    main { max-width: 1680px; margin: auto; padding: 46px 32px 70px; }
+    .intro { display: flex; align-items: flex-end; justify-content: space-between; gap: 28px; padding-bottom: 26px; }
+    h1 { margin: 0 0 10px; font-size: clamp(28px, 3vw, 43px); font-weight: 650; line-height: 1.12; letter-spacing: -1.5px; }
+    .intro p { margin: 0; max-width: 70ch; color: var(--muted); }
+    .progress { color: var(--muted); white-space: nowrap; font-size: 13px; }
+    .progress strong { color: var(--text); font-weight: 600; }
+    .index { display: flex; flex-wrap: wrap; gap: 7px; padding: 17px 0; border-block: 1px solid var(--line); }
+    .index a { border-radius: 4px; padding: 5px 10px; color: var(--muted); text-decoration: none; font-size: 13px; }
+    .index a:hover { background: #24334a; color: var(--text); }
+    .key { color: var(--muted); font-size: 12px; margin: 14px 0 0; }
+    .key code { color: var(--text); font-family: var(--mono); font-size: 11px; }
+    .example { padding-top: 38px; }
+    .example + .example { margin-top: 30px; border-top: 1px solid var(--line); }
+    .example-title { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 15px; }
+    h2 { font-size: 23px; font-weight: 600; letter-spacing: -.6px; margin: 0; line-height: 1.3; }
+    .kind { font-size: 12px; padding: 3px 9px; background: #253148; border-radius: 4px; color: var(--muted); }
+    .decision { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+    .decision button { font-size: 12px; padding: 3px 8px; }
+    .panes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; border: 1px solid var(--line); background: var(--line); border-radius: 7px; overflow: hidden; }
+    .pane { display: flex; flex-direction: column; min-width: 0; background: var(--panel); }
+    .pane-head { padding: 15px 18px 13px; min-height: 124px; border-bottom: 1px solid #293c54; }
+    .pane-label { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 650; margin-bottom: 9px; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; background: var(--muted); flex: 0 0 auto; }
+    .fp { --accent: var(--fp); } .native { --accent: var(--native); } .bun { --accent: var(--bun); }
+    .pane:not(.before) .dot { background: var(--accent); }
+    .rule { display: block; color: var(--accent, var(--muted)); font: 12px/1.55 var(--mono); overflow-wrap: anywhere; text-decoration-color: #64758d; }
+    .source-ref { color: var(--muted); font-size: 12px; text-underline-offset: 3px; overflow-wrap: anywhere; }
+    .source-ref:hover, .rule:hover { color: var(--text); }
+    .rule-count { display: block; color: var(--muted); font-size: 11px; margin-top: 6px; }
+    pre { margin: 0; padding: 16px 0 19px; background: var(--code); overflow-x: auto; font: 12px/1.9 var(--mono); tab-size: 2; flex: 1; }
+    pre code { display: block; min-width: 0; }
+    .code-line { display: grid; grid-template-columns: 39px minmax(0, 1fr); column-gap: 12px; padding-right: 18px; min-height: 1.9em; }
+    .line-number { text-align: right; color: #72849e; user-select: none; font-size: 10px; }
+    .code-content { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .code-line.changed { background: #86b6d60d; border-left: 2px solid var(--accent, var(--line)); grid-template-columns: 37px minmax(0, 1fr); }
+    .token-comment { color: #96a6bf; font-style: italic; }
+    .token-keyword { color: #d0baff; }
+    .token-string { color: #b5d6b0; }
+    .token-number { color: #f1ce95; }
+    .token-type { color: #8ed2d5; }
+    .token-function { color: #a7c9ff; }
+    .outcome { min-height: 90px; padding: 12px 18px; border-top: 1px solid #293c54; font-size: 12px; color: var(--muted); }
+    .verdict { display: flex; align-items: flex-start; gap: 7px; font-weight: 600; margin-bottom: 4px; }
+    .verdict.pass { color: var(--pass); } .verdict.fail { color: var(--fail); } .verdict.open { color: var(--bun); }
+    .choose { padding: 0 18px 16px; }
+    .choose button { width: 100%; font-size: 12px; text-align: left; color: var(--accent); border-color: #46566e; }
+    .choose button[aria-pressed="true"] { background: #2a3a52; border-color: var(--accent); }
+    .choice-spacer { display: block; height: 37px; }
+    .together { margin-top: 10px; background: #17283a; border: 1px solid #354c61; border-radius: 5px; }
+    .together summary { padding: 11px 16px; cursor: pointer; font-size: 13px; color: var(--pass); }
+    .together-body { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 20px; padding: 0 16px 14px; }
+    .together pre { border: 1px solid #304057; border-radius: 3px; }
+    .together button { color: var(--pass); white-space: nowrap; font-size: 12px; }
+    .boundary { font-size: 12px; color: var(--bun); border-left: 2px solid var(--bun); padding: 6px 12px; margin: 13px 0 0; max-width: 100ch; }
+    footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-top: 45px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+    .toast { position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); padding: 10px 18px; color: var(--text); border: 1px solid #5f7793; border-radius: 5px; background: #253950; z-index: 6; max-width: calc(100vw - 30px); text-align: center; }
+    .toast:empty { display: none; }
+    dialog { max-width: 650px; width: calc(100% - 30px); background: var(--panel); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 24px; }
+    dialog::backdrop { background: #070e1abd; }
+    dialog h2 { margin-bottom: 8px; }
+    dialog p { color: var(--muted); }
+    textarea { width: 100%; height: 250px; resize: vertical; padding: 12px; color: var(--text); background: var(--code); border: 1px solid var(--line); border-radius: 4px; font: 12px/1.7 var(--mono); }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 12px; }
+    @media (min-width: 1700px) { pre { font-size: 13px; } }
+    @media (max-width: 1100px) { .masthead-inner, main { padding-left: 20px; padding-right: 20px; } pre { font-size: 11px; } .pane-head, .outcome { padding-left: 13px; padding-right: 13px; } .code-line { grid-template-columns: 25px minmax(0, 1fr); column-gap: 8px; } .code-line.changed { grid-template-columns: 23px minmax(0, 1fr); } }
+    @media (max-width: 760px) {
+      html { scroll-padding-top: 95px; }
+      .masthead-inner { padding: 11px 16px; gap: 10px; } .project { display: none; }
+      .actions { gap: 12px; } .actions a { display: none; }
+      main { padding: 28px 16px 40px; } .intro { display: block; } .progress { margin-top: 15px; }
+      .panes { grid-template-columns: minmax(0, 1fr); gap: 1px; }
+      .pane-head { min-height: 0; padding: 14px 16px; } .pane-label { margin-bottom: 5px; }
+      pre { font-size: 12px; } .outcome { min-height: 0; padding: 12px 16px; }
+      .before pre { max-height: 260px; } .choose { padding: 0 16px 16px; }
+      .before .choose { display: none; }
+      .example-title { align-items: flex-start; } .decision { width: 100%; margin-left: 0; }
+      .example { padding-top: 29px; } .together-body { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+      .together button { justify-self: start; } .index { gap: 2px; } .index a { padding: 5px 8px; }
+    }
+    @media (prefers-reduced-motion: no-preference) { button { transition: background-color .12s, border-color .12s; } }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#examples">Skip to examples</a>
+  <header class="masthead">
+    <div class="masthead-inner">
+      <a class="brand" href="#top"><span class="brand-symbol" aria-hidden="true">{ }</span>Lint choices</a>
+      <span class="project">video-library</span>
+      <div class="actions">
+        <a href="strict-functional-lint.md">Full rule report</a>
+        <button type="button" id="copy-choices">Copy choices</button>
+      </div>
+    </div>
+  </header>
+  <main id="top">
+    <div class="intro">
+      <div>
+        <h1>Compare the fixes.</h1>
+        <p>Your source and tests, with two proposed rewrites. A fix for one rule can still fail the other.</p>
+      </div>
+      <div class="progress" aria-live="polite"><strong id="chosen-count">0 / 7</strong> choices noted</div>
+    </div>
+    <nav class="index" aria-label="Conflict examples" id="index"></nav>
+    <p class="key">Before: exact source excerpts, with original line numbers. Fixes: proposals only. Examples isolate the named rules, not the entire lint policy. Counts are project-wide rule totals; zero does not mean a hypothetical rewrite passes.</p>
+    <noscript><p>This offline page needs JavaScript to display its examples. The <a href="strict-functional-lint.md">Markdown report</a> is available without JavaScript.</p></noscript>
+    <div id="examples"></div>
+    <footer>
+      <span>Choices are notes only. No configuration or code is changed.</span>
+      <span id="storage-note">Saved in this browser when local storage is available. No network requests.</span>
+    </footer>
+  </main>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <dialog id="choices-dialog" aria-labelledby="dialog-title">
+    <h2 id="dialog-title">Your rule choices</h2>
+    <p>Copy these notes into the conversation when you’re ready.</p>
+    <textarea id="choices-text" readonly aria-label="Rule preference notes"></textarea>
+    <div class="dialog-actions"><button id="select-notes" type="button">Select notes</button><button id="close-dialog" type="button">Close</button></div>
+  </dialog>
+  <script>
+    const examples = [
+  {
+    "id": "void",
+    "title": "A void callback in a container test",
+    "short": "Void callback",
+    "kind": "Direct conflict",
+    "source": {
+      "file": "scripts/containers.test.ts",
+      "start": 27,
+      "end": 27,
+      "excerpt": true
+    },
+    "before": {
+      "code": "() => checkSourceContainer('clip.mkv', input)",
+      "lines": [
+        1
+      ],
+      "verdict": "The real callback, extracted from expect",
+      "detail": "The shorthand returns void. Only the callback is compared here, not the surrounding assertion."
+    },
+    "a": {
+      "family": "fp",
+      "rule": "fp/no-unused-expression",
+      "count": 1042,
+      "code": "() => {\n  return checkSourceContainer('clip.mkv', input);\n}",
+      "lines": [
+        2
+      ],
+      "status": "fail",
+      "verdict": "Callback passes FP; void rule still fails",
+      "detail": "return uses the call result, but no-confusing-void-expression rejects returning a void value.",
+      "choice": "Keep the FP expression constraint"
+    },
+    "b": {
+      "family": "native",
+      "rule": "typescript/no-confusing-void-expression",
+      "count": 76,
+      "code": "() => {\n  checkSourceContainer('clip.mkv', input);\n}",
+      "lines": [
+        2
+      ],
+      "status": "fail",
+      "verdict": "Void rule passes; callback fails FP",
+      "detail": "The standalone call violates no-unused-expression. Its block also violates no-nil.",
+      "choice": "Allow the standalone void call"
+    },
+    "boundary": "No equivalent direct callback rewrite satisfies these constraints together. The surrounding Bun assertion is also an effect; it is not silently treated as FP-compliant."
+  },
+  {
+    "id": "file-write",
+    "title": "Writing the platform test fixture",
+    "short": "Bun file write",
+    "kind": "Bun + FP boundary",
+    "source": {
+      "file": "scripts/platform.test.ts",
+      "start": 85,
+      "end": 87,
+      "excerpt": false
+    },
+    "before": {
+      "code": "const path = join(dir, 'file');\nawait writeFile(path, 'data');\nconst space = await availableBytes(dir);",
+      "lines": [
+        2
+      ],
+      "verdict": "Node write + standalone effect",
+      "detail": "This exact write is flagged by both bun/prefer-bun-write and fp/no-unused-expression."
+    },
+    "a": {
+      "family": "bun",
+      "rule": "bun/prefer-bun-write",
+      "count": 38,
+      "code": "const path = join(dir, 'file');\nawait Bun.write(path, 'data');\nconst space = await availableBytes(dir);",
+      "lines": [
+        2
+      ],
+      "status": "fail",
+      "verdict": "Bun preference passes; FP still fails",
+      "detail": "Bun.write returns a byte count, but the standalone await still discards it.",
+      "choice": "Prefer the Bun API"
+    },
+    "b": {
+      "family": "fp",
+      "rule": "fp/no-unused-expression",
+      "count": 1042,
+      "code": "const path = join(dir, 'file');\nconst writeResult = await writeFile(path, 'data');\nconst space = await availableBytes(dir);",
+      "lines": [
+        2
+      ],
+      "status": "fail",
+      "verdict": "Expression shape passes; two checks remain",
+      "detail": "Node writeFile still violates Bunisms. Capturing its void result also violates no-confusing-void-expression.",
+      "choice": "Keep the result-binding constraint"
+    },
+    "together": "const path = join(dir, 'file');\nconst bytesWritten = await Bun.write(path, 'data');\nconst space = await availableBytes(dir);",
+    "boundary": "The shared example captures Bun’s numeric result without dropping a void value. The surrounding test must use bytesWritten; this does not make filesystem IO semantically pure or resolve its other test effects."
+  },
+  {
+    "id": "returns",
+    "title": "Validating a reference URL",
+    "short": "Final returns",
+    "kind": "Syntactic trap",
+    "source": {
+      "file": "scripts/media.ts",
+      "start": 130,
+      "end": 134,
+      "excerpt": false
+    },
+    "before": {
+      "code": "function validReference(value: unknown): boolean {\n  if (!text(value) || !value.trim()) return false;\n  try { const url = new URL(value); return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password; }\n  catch { return false; }\n}",
+      "lines": [
+        3,
+        4
+      ],
+      "verdict": "Every path returns; no-nil still flags it",
+      "detail": "The final statement is try/catch, not a ReturnStatement. There is no existing unreachable-code diagnostic."
+    },
+    "a": {
+      "family": "fp",
+      "rule": "fp/no-nil",
+      "count": 362,
+      "code": "function validReference(value: unknown): boolean {\n  if (!text(value) || value.trim() === '') return false;\n  const url = URL.parse(value);\n  return url !== null\n    && ['https:', 'http:'].includes(url.protocol)\n    && url.username === '' && url.password === '';\n}",
+      "lines": [
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "status": "pass",
+      "verdict": "Passes both named rules",
+      "detail": "URL.parse reports malformed URLs as null. A final boolean return replaces the exception-based parse. Requires URL.parse support.",
+      "choice": "Use a final value-returning shape"
+    },
+    "b": {
+      "family": "native",
+      "rule": "no-unreachable",
+      "count": 0,
+      "code": "function validReference(value: unknown): boolean {\n  if (!text(value) || !value.trim()) return false;\n  try { const url = new URL(value); return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password; }\n  catch { return false; }\n}",
+      "lines": [],
+      "status": "fail",
+      "verdict": "No unreachable code; no-nil still fails",
+      "detail": "Keep the existing complete try/catch returns. Appending a dummy return would introduce unreachable code.",
+      "choice": "Allow exhaustive try/catch returns"
+    },
+    "boundary": "This comparison also replaces implicit truthiness checks with explicit comparisons. It is a proposed function rewrite, not an applied change."
+  },
+  {
+    "id": "booleans",
+    "title": "Checking the Linux CPU-list match",
+    "short": "Boolean guard",
+    "kind": "Fix conflict",
+    "source": {
+      "file": "scripts/queue.ts",
+      "start": 17,
+      "end": 18,
+      "excerpt": false
+    },
+    "before": {
+      "code": "const allowed = readFileSync(\"/proc/self/status\", \"utf8\").match(/^Cpus_allowed_list:\\s*(.+)$/m)?.[1];\nif (!allowed) return 1;",
+      "lines": [
+        2
+      ],
+      "verdict": "Nullable string used for truthiness",
+      "detail": "allowed is string | undefined. The current guard intentionally rejects both missing and empty strings."
+    },
+    "a": {
+      "family": "native",
+      "rule": "typescript/strict-boolean-expressions",
+      "count": 139,
+      "code": "const allowed = readFileSync(\"/proc/self/status\", \"utf8\").match(/^Cpus_allowed_list:\\s*(.+)$/m)?.[1];\nif (!Boolean(allowed)) return 1;",
+      "lines": [
+        2
+      ],
+      "status": "fail",
+      "verdict": "Strict boolean passes; cast rule fails",
+      "detail": "Boolean makes the conversion explicit. no-extra-boolean-cast flags it in the negated condition.",
+      "choice": "Keep explicit boolean conversion"
+    },
+    "b": {
+      "family": "native",
+      "rule": "no-extra-boolean-cast",
+      "count": 0,
+      "code": "const allowed = readFileSync(\"/proc/self/status\", \"utf8\").match(/^Cpus_allowed_list:\\s*(.+)$/m)?.[1];\nif (!allowed) return 1;",
+      "lines": [],
+      "status": "fail",
+      "verdict": "Cast rule passes; strict boolean fails",
+      "detail": "The original shorthand contains no redundant cast, but still tests string | undefined.",
+      "choice": "Allow the current truthiness guard"
+    },
+    "together": "const allowed = readFileSync(\"/proc/self/status\", \"utf8\").match(/^Cpus_allowed_list:\\s*(.+)$/m)?.[1];\nif (allowed === undefined || allowed === '') return 1;",
+    "boundary": "Checking only allowed === undefined would change the current empty-string behavior. The shared alternative preserves both cases."
+  },
+  {
+    "id": "errors",
+    "title": "Rejecting an invalid job count",
+    "short": "Error contract",
+    "kind": "Error-flow decision",
+    "source": {
+      "file": "scripts/queue.ts",
+      "start": 49,
+      "end": 57,
+      "excerpt": false
+    },
+    "before": {
+      "code": "export function resolveJobs(value: string | number | undefined = \"auto\"): number {\n  const cap = maxJobs();\n  if (value === \"auto\") return cap;\n  const jobs = typeof value === \"string\" && /^\\d+$/.test(value) ? Number(value) : value;\n  if (typeof jobs !== \"number\" || !Number.isSafeInteger(jobs) || jobs < 1 || jobs > cap) {\n    throw new Error(`jobs must be a positive safe integer <= ${cap}`);\n  }\n  return jobs;\n}",
+      "lines": [
+        6
+      ],
+      "verdict": "Current guard throws",
+      "detail": "fp/no-throw reports the throw. missing-throw has no current error here; the exception is already thrown."
+    },
+    "a": {
+      "family": "fp",
+      "rule": "fp/no-throw",
+      "count": 93,
+      "code": "export function resolveJobs(value: string | number | undefined = \"auto\"): number | Error {\n  const cap = maxJobs();\n  if (value === \"auto\") return cap;\n  const jobs = typeof value === \"string\" && /^\\d+$/.test(value) ? Number(value) : value;\n  if (typeof jobs !== \"number\" || !Number.isSafeInteger(jobs) || jobs < 1 || jobs > cap) {\n    return new Error(`jobs must be a positive safe integer <= ${cap}`);\n  }\n  return jobs;\n}",
+      "lines": [
+        1,
+        6
+      ],
+      "status": "pass",
+      "verdict": "Passes both named rules; API changes",
+      "detail": "The caller now receives number | Error and must handle the error result. This is not a drop-in change.",
+      "choice": "Return the validation error"
+    },
+    "b": {
+      "family": "native",
+      "rule": "oxc/missing-throw",
+      "count": 0,
+      "code": "export function resolveJobs(value: string | number | undefined = \"auto\"): number {\n  const cap = maxJobs();\n  if (value === \"auto\") return cap;\n  const jobs = typeof value === \"string\" && /^\\d+$/.test(value) ? Number(value) : value;\n  if (typeof jobs !== \"number\" || !Number.isSafeInteger(jobs) || jobs < 1 || jobs > cap) {\n    throw new Error(`jobs must be a positive safe integer <= ${cap}`);\n  }\n  return jobs;\n}",
+      "lines": [],
+      "status": "fail",
+      "verdict": "No missing throw; FP still flags throw",
+      "detail": "Keep the existing number-or-exception contract. Discarding a constructed Error would instead trigger missing-throw.",
+      "choice": "Keep exception-based validation"
+    },
+    "boundary": "A discarded new Error is not present in this source. This real example shows the choice between the existing throw and a returned error; it does not invent a missing-throw violation."
+  },
+  {
+    "id": "loops",
+    "title": "Building FFmpeg stream-map arguments",
+    "short": "FFmpeg arguments",
+    "kind": "Iteration decision",
+    "source": {
+      "file": "scripts/media.ts",
+      "start": 106,
+      "end": 108,
+      "excerpt": false
+    },
+    "before": {
+      "code": "const args = ['ffmpeg', '-nostdin', '-n', '-v', 'warning', '-i', item.source];\nfor (const s of selected) args.push('-map', `0:${s.index}`);\nargs.push('-map_chapters', '0', '-map_metadata', '-1', '-map_metadata:s', '-1', '-c', 'copy');",
+      "lines": [
+        2,
+        3
+      ],
+      "verdict": "Loop + mutation are current FP errors",
+      "detail": "The source already uses for…of, so no-array-for-each has no current complaint."
+    },
+    "a": {
+      "family": "fp",
+      "rule": "fp/no-loops",
+      "count": 77,
+      "code": "const args = [\n  'ffmpeg', '-nostdin', '-n', '-v', 'warning', '-i', item.source,\n  ...selected.flatMap(s => ['-map', `0:${s.index}`]),\n  '-map_chapters', '0', '-map_metadata', '-1',\n  '-map_metadata:s', '-1', '-c', 'copy',\n];",
+      "lines": [
+        3,
+        4,
+        5
+      ],
+      "status": "pass",
+      "verdict": "Passes both named rules",
+      "detail": "flatMap preserves each -map / stream pair and its order without a loop statement.",
+      "choice": "Use value-producing composition"
+    },
+    "b": {
+      "family": "native",
+      "rule": "unicorn/no-array-for-each",
+      "count": 0,
+      "code": "const args = ['ffmpeg', '-nostdin', '-n', '-v', 'warning', '-i', item.source];\nfor (const s of selected) args.push('-map', `0:${s.index}`);\nargs.push('-map_chapters', '0', '-map_metadata', '-1', '-map_metadata:s', '-1', '-c', 'copy');",
+      "lines": [],
+      "status": "fail",
+      "verdict": "No forEach; FP still flags the loop",
+      "detail": "This is already the loop shape Unicorn recommends instead of forEach. It does not meet the stronger FP policy.",
+      "choice": "Keep the current loop"
+    },
+    "boundary": "Only the initial argument construction is compared. Later args.push calls and counters in this function remain separate FP violations."
+  },
+  {
+    "id": "copies",
+    "title": "Copying subtitle data in a container test",
+    "short": "Fixture copies",
+    "kind": "Prospective performance advice",
+    "source": {
+      "file": "scripts/containers.test.ts",
+      "start": 38,
+      "end": 40,
+      "excerpt": false
+    },
+    "before": {
+      "code": "const xsub = { ...sample, streams: sample.streams.map(s => s.codec_type === 'subtitle' ? { ...s, codec_name: 'xsub' } : s) };\nexpect(() => checkContainer(containerProfile('.avi'), xsub, [0, 1, 2])).not.toThrow();\nexpect(() => checkContainer(containerProfile('.wmv'), { ...sample, chapters: [{}] }, [0, 1])).toThrow('chapters');",
+      "lines": [
+        1
+      ],
+      "verdict": "A fresh subtitle object protects sample",
+      "detail": "There is no current no-map-spread diagnostic on this line. The comparison shows the effect of its documented mutation-based advice."
+    },
+    "a": {
+      "family": "fp",
+      "rule": "fp/no-mutating-assign",
+      "count": 0,
+      "code": "const xsub = { ...sample, streams: sample.streams.map(s => s.codec_type === 'subtitle' ? { ...s, codec_name: 'xsub' } : s) };\nexpect(() => checkContainer(containerProfile('.avi'), xsub, [0, 1, 2])).not.toThrow();\nexpect(() => checkContainer(containerProfile('.wmv'), { ...sample, chapters: [{}] }, [0, 1])).toThrow('chapters');",
+      "lines": [],
+      "status": "pass",
+      "verdict": "Preserves the shared test fixture",
+      "detail": "Keep the copied subtitle stream. This named FP rule and the current no-map-spread defaults both accept the source.",
+      "choice": "Preserve the input fixture"
+    },
+    "b": {
+      "family": "native",
+      "rule": "oxc/no-map-spread",
+      "count": 0,
+      "code": "const xsub = { ...sample, streams: sample.streams.map(s => s.codec_type === 'subtitle' ? Object.assign(s, { codec_name: 'xsub' }) : s) };\nexpect(() => checkContainer(containerProfile('.avi'), xsub, [0, 1, 2])).not.toThrow();\nexpect(() => checkContainer(containerProfile('.wmv'), { ...sample, chapters: [{}] }, [0, 1])).toThrow('chapters');",
+      "lines": [
+        1
+      ],
+      "status": "fail",
+      "verdict": "Mutation suggestion fails FP",
+      "detail": "Object.assign changes the original subtitle in sample. Later tests can observe the change. Not an equivalent, safe rewrite.",
+      "choice": "Consider mutation-based optimization"
+    },
+    "boundary": "This is a prospective advice conflict, not a fix currently offered on this source. Do not mutate a shared fixture just to avoid an allocation."
+  }
+];
+
+    const storageKey = "video-library:real-source-lint-choices:v1";
+    let storageAvailable = true;
+    let choices = {};
+    try {
+      const saved = JSON.parse(localStorage.getItem(storageKey) || "{}");
+      if (saved && typeof saved === "object" && !Array.isArray(saved)) {
+        for (const example of examples) {
+          const value = saved[example.id];
+          if (value === "a" || value === "b" || (value === "both" && example.together)) choices[example.id] = value;
+        }
+      }
+    } catch { storageAvailable = false; }
+
+    const escape = (text) => String(text).replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
+    const keywords = new Set("const let function return if else throw new import from for of true false undefined null async await readonly typeof as".split(" "));
+    const types = new Set("void number string boolean Error Promise Result Map Set".split(" "));
+    const tokens = /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b\d+(?:\.\d+)?\b|\b[A-Za-z_$][\w$]*\b/g;
+    function highlight(source) {
+      let output = "", last = 0;
+      for (const match of source.matchAll(tokens)) {
+        output += escape(source.slice(last, match.index));
+        const token = match[0];
+        const kind = token.startsWith("//") || token.startsWith("/*") ? "comment"
+          : token[0] === '"' || token[0] === "'" ? "string"
+          : /^\d/.test(token) ? "number"
+          : keywords.has(token) ? "keyword"
+          : types.has(token) ? "type"
+          : /^\s*\(/.test(source.slice(match.index + token.length)) ? "function" : "";
+        output += kind ? `<span class="token-${kind}">${escape(token)}</span>` : escape(token);
+        last = match.index + token.length;
+      }
+      return output + escape(source.slice(last));
+    }
+    function codeBlock(code, lines = [], label = "TypeScript example", start = 1) {
+      const highlighted = highlight(code).split("\n");
+      return `<pre tabindex="0" aria-label="${escape(label)}"><code>${highlighted.map((line, index) => `<span class="code-line${lines.includes(index + 1) ? " changed" : ""}"><span class="line-number" aria-hidden="true">${start + index}</span><span class="code-content">${line || " "}</span></span>`).join("")}</code></pre>`;
+    }
+    function ruleUrl(rule) {
+      const [family, name] = rule.includes("/") ? rule.split("/") : ["eslint", rule];
+      if (family === "fp") return `https://github.com/jfmengels/eslint-plugin-fp/blob/5f4c679477a88ac3c386cbfe5c194f3c15d1a2c6/docs/rules/${name}.md`;
+      if (family === "bun") return `https://github.com/himynameisdave/eslint-plugin-bunisms/blob/7c9db1ac16d56f2b2cc971f0446db520a85b8f38/docs/rules/${name}.md`;
+      return `https://oxc.rs/docs/guide/usage/linter/rules/${family}/${name}.html`;
+    }
+    function sourceLabel(example) {
+      const source = example.source;
+      return `${source.file}:${source.start}${source.end === source.start ? "" : `–${source.end}`}${source.excerpt ? " · expression excerpt" : ""}`;
+    }
+    function pane(example, variant) {
+      const item = variant === "before" ? example.before : example[variant];
+      const isBefore = variant === "before";
+      const label = isBefore ? "Before" : variant === "a" ? "Rule 1 fix" : "Rule 2 fix";
+      const status = isBefore ? "open" : item.status;
+      const symbol = status === "pass" ? "✓" : status === "fail" ? "!" : "?";
+      return `<div class="pane ${isBefore ? "before" : item.family}">
+        <div class="pane-head"><div class="pane-label"><span class="dot" aria-hidden="true"></span>${label}</div>
+          ${isBefore ? `<a class="rule" href="../${example.source.file}#L${example.source.start}">${escape(sourceLabel(example))}</a>` : `<a class="rule" href="${ruleUrl(item.rule)}" target="_blank" rel="noopener noreferrer">${escape(item.rule)}</a>`}
+          <span class="rule-count">${isBefore ? "Copied from your code; indentation normalized" : `${escape(item.count)} current project errors · proposed rewrite`}</span>
+        </div>
+        ${codeBlock(item.code, item.lines, `${example.title}: ${label}`, isBefore ? example.source.start : 1)}
+        <div class="outcome"><div class="verdict ${status}"><span aria-hidden="true">${symbol}</span><span>${escape(item.verdict)}</span></div>${escape(item.detail)}</div>
+        ${isBefore ? `<div class="choose" aria-hidden="true"><span class="choice-spacer"></span></div>` : `<div class="choose"><button type="button" data-example="${example.id}" data-choice="${variant}" aria-pressed="false">${escape(item.choice)}</button></div>`}
+      </div>`;
+    }
+    document.getElementById("index").innerHTML = examples.map((example) => `<a href="#${example.id}">${escape(example.short)}</a>`).join("");
+    document.getElementById("examples").innerHTML = examples.map((example) => `<section class="example" id="${example.id}" aria-labelledby="heading-${example.id}">
+      <div class="example-title"><h2 id="heading-${example.id}">${escape(example.title)}</h2><span class="kind">${escape(example.kind)}</span><span class="decision" id="decision-${example.id}"></span></div>
+      <div class="panes">${pane(example, "before")}${pane(example, "a")}${pane(example, "b")}</div>
+      ${example.together ? `<details class="together"><summary>Example that keeps both rules</summary><div class="together-body">${codeBlock(example.together, [], `${example.title}: keeps both`)}<button type="button" data-example="${example.id}" data-choice="both" aria-pressed="false">Keep both rules</button></div></details>` : ""}
+      ${example.boundary ? `<p class="boundary">${escape(example.boundary)}</p>` : ""}
+    </section>`).join("");
+
+    function update() {
+      let count = 0;
+      for (const example of examples) {
+        const selected = choices[example.id];
+        if (selected) count++;
+        const label = selected === "a" ? "Rule 1 noted" : selected === "b" ? "Rule 2 noted" : selected === "both" ? "Keep both noted" : "Undecided";
+        document.getElementById(`decision-${example.id}`).innerHTML = `${label}${selected ? ` <button type="button" data-reset="${example.id}" aria-label="Clear choice for ${escape(example.title)}">Clear</button>` : ""}`;
+        document.querySelectorAll(`[data-example="${example.id}"]`).forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.choice === selected)));
+      }
+      document.getElementById("chosen-count").textContent = `${count} / ${examples.length}`;
+      if (!storageAvailable) document.getElementById("storage-note").textContent = "Browser storage unavailable; keep this tab open or copy your choices. No network requests.";
+    }
+    function save() {
+      try { localStorage.setItem(storageKey, JSON.stringify(choices)); } catch { storageAvailable = false; }
+      update();
+    }
+    document.getElementById("examples").addEventListener("click", (event) => {
+      const button = event.target.closest("button");
+      if (!button) return;
+      if (button.dataset.reset) {
+        const id = button.dataset.reset;
+        delete choices[id]; save();
+        document.querySelector(`[data-example="${id}"]`).focus();
+      } else if (button.dataset.choice) {
+        choices[button.dataset.example] = button.dataset.choice; save();
+      }
+    });
+    function notes() {
+      return ["Lint rule preferences — notes only; do not apply code fixes.", "", ...examples.map((example) => {
+        const selected = choices[example.id];
+        const result = selected === "both" ? "Keep both rules" : selected ? `Prefer ${example[selected].rule} (${example[selected].choice})` : "Undecided";
+        return `${sourceLabel(example)} — ${example.title}: ${result}`;
+      })].join("\n");
+    }
+    let toastTimer;
+    function toast(message) {
+      document.getElementById("toast").textContent = message;
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { document.getElementById("toast").textContent = ""; }, 4000);
+    }
+    document.getElementById("copy-choices").addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(notes());
+        toast("Choices copied. No rules changed.");
+      } catch {
+        document.getElementById("choices-text").value = notes();
+        document.getElementById("choices-dialog").showModal();
+        document.getElementById("choices-text").focus();
+        document.getElementById("choices-text").select();
+      }
+    });
+    document.getElementById("select-notes").addEventListener("click", () => { document.getElementById("choices-text").focus(); document.getElementById("choices-text").select(); });
+    document.getElementById("close-dialog").addEventListener("click", () => document.getElementById("choices-dialog").close());
+    update();
+  </script>
+</body>
+</html>

@@ -11,7 +11,9 @@
   },
   "devDependencies": {
     "@types/bun": "1.4.4",
-    "oxlint": "^1.93.0",
+    "eslint-plugin-bunisms": "0.11.0",
+    "eslint-plugin-fp": "2.3.0",
+    "oxlint": "1.93.0",
     "oxlint-tsgolint": "^7.0.2006"
   },
   "module": "index.ts",

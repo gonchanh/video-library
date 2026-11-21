@@ -92,4 +92,4 @@ Windows native behavior has source review, not machine validation. Its directory
 
 `bun run doctor` is the full verification command. Missing external tools fail rather than skip coverage. The isolated Jellyfin test checks distinct flat-movie sidecars and episode metadata, with Internet providers disabled. See [Jellyfin reference](jellyfin.md) for tested behavior and current source links.
 
-[Oxlint rationale](lint-research.md) explains the selected type-aware rules and narrowly scoped exceptions. Generated BAML code is excluded from lint; handwritten wrappers and tests remain checked.
+[Strict Oxlint policy](strict-functional-lint.md) explains every added or strengthened functional/procedural and Bun rule, with source/test violation counts. Generated BAML code is excluded from lint; handwritten wrappers and tests use the same rules without test-only exceptions.
